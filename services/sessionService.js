@@ -1,35 +1,42 @@
 const db = require('../db/database');
+const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all().map((column) => column.name);
+const hasUpdatedAtColumn = sessionColumns.includes('updatedAt');
 
 const listSessionsStmt = db.prepare(`
   SELECT
     s.id,
     s.title,
     s.createdAt,
-    s.updatedAt,
+    s.last_message_at AS lastMessageAt,
+    COALESCE(s.last_message_preview, '') AS lastMessagePreview,
+    (
+      SELECT COUNT(*)
+      FROM chat_messages cm
+      WHERE cm.sessionId = s.id
+    ) AS messageCount,
     (
       SELECT COUNT(*)
       FROM pdfs p
       WHERE p.sessionId = s.id
     ) AS pdfCount
   FROM sessions s
-  ORDER BY s.updatedAt DESC, s.id DESC
+  ORDER BY (s.last_message_at IS NULL) ASC, s.last_message_at DESC, s.id DESC
 `);
 
-const insertSessionStmt = db.prepare(`
-  INSERT INTO sessions (title, createdAt, updatedAt)
-  VALUES (@title, @createdAt, @updatedAt)
-`);
+const insertSessionStmt = hasUpdatedAtColumn
+  ? db.prepare(`
+      INSERT INTO sessions (title, createdAt, updatedAt)
+      VALUES (@title, @createdAt, @updatedAt)
+    `)
+  : db.prepare(`
+      INSERT INTO sessions (title, createdAt)
+      VALUES (@title, @createdAt)
+    `);
 
 const getSessionStmt = db.prepare(`
-  SELECT id, title, createdAt, updatedAt
+  SELECT id, title, createdAt, last_message_at AS lastMessageAt, COALESCE(last_message_preview, '') AS lastMessagePreview
   FROM sessions
   WHERE id = ?
-`);
-
-const touchSessionStmt = db.prepare(`
-  UPDATE sessions
-  SET updatedAt = @updatedAt
-  WHERE id = @id
 `);
 
 const deleteSessionStmt = db.prepare(`
@@ -48,12 +55,19 @@ const deleteSessionChunksStmt = db.prepare(`
 `);
 
 const deleteSessionHistoryStmt = db.prepare(`
-  DELETE FROM chat_history
+  DELETE FROM chat_messages
   WHERE sessionId = ?
 `);
 
 function listSessions() {
-  return listSessionsStmt.all();
+  return listSessionsStmt.all().map((session) => ({
+    ...session,
+    title: String(session.title || '').trim() || `Session ${session.id}`,
+    lastMessageAt: session.lastMessageAt || null,
+    lastMessagePreview: String(session.lastMessagePreview || ''),
+    messageCount: Number(session.messageCount || 0),
+    pdfCount: Number(session.pdfCount || 0),
+  }));
 }
 
 function getSessionById(sessionId) {
@@ -62,17 +76,16 @@ function getSessionById(sessionId) {
 
 function createSession(title) {
   const now = new Date().toISOString();
-  const result = insertSessionStmt.run({
+  const payload = {
     title: title.trim(),
     createdAt: now,
-    updatedAt: now,
-  });
+  };
+  if (hasUpdatedAtColumn) {
+    payload.updatedAt = now;
+  }
+  const result = insertSessionStmt.run(payload);
 
   return getSessionById(Number(result.lastInsertRowid));
-}
-
-function touchSession(sessionId) {
-  touchSessionStmt.run({ id: sessionId, updatedAt: new Date().toISOString() });
 }
 
 function assertSessionExists(sessionId) {
@@ -104,6 +117,5 @@ module.exports = {
   createSession,
   getSessionById,
   assertSessionExists,
-  touchSession,
   deleteSession,
 };

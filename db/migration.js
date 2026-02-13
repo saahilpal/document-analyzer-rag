@@ -36,6 +36,14 @@ function logAction(actions, sql, description) {
   actions.push({ sql, description });
 }
 
+function columnExists(db, tableName, columnName) {
+  if (!tableExists(db, tableName)) {
+    return false;
+  }
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name);
+  return columns.includes(columnName);
+}
+
 function ensureNewTables(db, actions) {
   const statements = [
     {
@@ -44,7 +52,8 @@ function ensureNewTables(db, actions) {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
         createdAt TEXT NOT NULL,
-        updatedAt TEXT NOT NULL
+        last_message_at TEXT,
+        last_message_preview TEXT
       );`,
     },
     {
@@ -77,20 +86,30 @@ function ensureNewTables(db, actions) {
       );`,
     },
     {
-      description: 'Create chat_history table',
-      sql: `CREATE TABLE IF NOT EXISTS chat_history (
+      description: 'Create chat_messages table',
+      sql: `CREATE TABLE IF NOT EXISTS chat_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sessionId INTEGER NOT NULL,
         role TEXT NOT NULL,
         text TEXT NOT NULL,
-        metadata TEXT,
         createdAt TEXT NOT NULL,
         FOREIGN KEY (sessionId) REFERENCES sessions(id) ON DELETE CASCADE
       );`,
     },
     {
-      description: 'Create sessions updatedAt index',
-      sql: 'CREATE INDEX IF NOT EXISTS idx_sessions_updatedAt ON sessions(updatedAt);',
+      description: 'Create job_queue table',
+      sql: `CREATE TABLE IF NOT EXISTS job_queue (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        maxRetries INTEGER NOT NULL DEFAULT 3,
+        result TEXT,
+        error TEXT,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );`,
     },
     {
       description: 'Create pdfs sessionId index',
@@ -113,8 +132,16 @@ function ensureNewTables(db, actions) {
       sql: 'CREATE INDEX IF NOT EXISTS idx_chunks_createdAt ON chunks(createdAt);',
     },
     {
-      description: 'Create chat_history sessionId index',
-      sql: 'CREATE INDEX IF NOT EXISTS idx_chat_history_sessionId ON chat_history(sessionId);',
+      description: 'Create chat_messages sessionId index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_chat_messages_sessionId ON chat_messages(sessionId);',
+    },
+    {
+      description: 'Create chat_messages sessionId+createdAt+id index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_chat_messages_sessionId_createdAt_id ON chat_messages(sessionId, createdAt, id);',
+    },
+    {
+      description: 'Create job_queue status index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_job_queue_status ON job_queue(status);',
     },
   ];
 
@@ -124,10 +151,78 @@ function ensureNewTables(db, actions) {
   }
 }
 
+function ensureSessionMetadataColumns(db, actions) {
+  if (!columnExists(db, 'sessions', 'last_message_at')) {
+    const sql = 'ALTER TABLE sessions ADD COLUMN last_message_at TEXT;';
+    logAction(actions, sql, 'Add sessions.last_message_at column');
+    db.exec(sql);
+  }
+
+  if (!columnExists(db, 'sessions', 'last_message_preview')) {
+    const sql = 'ALTER TABLE sessions ADD COLUMN last_message_preview TEXT;';
+    logAction(actions, sql, 'Add sessions.last_message_preview column');
+    db.exec(sql);
+  }
+
+  const indexSql = 'CREATE INDEX IF NOT EXISTS idx_sessions_last_message_at ON sessions(last_message_at);';
+  logAction(actions, indexSql, 'Create sessions last_message_at index');
+  db.exec(indexSql);
+}
+
+function normalizeChatMessageTimestamps(db, actions) {
+  if (!tableExists(db, 'chat_messages')) {
+    return;
+  }
+
+  const sql = `
+    UPDATE chat_messages
+    SET createdAt = COALESCE(NULLIF(createdAt, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    WHERE createdAt IS NULL OR createdAt = '';
+  `;
+  logAction(actions, sql.trim(), 'Normalize missing chat_messages.createdAt');
+  db.exec(sql);
+}
+
+function backfillSessionMessageMetadata(db, actions) {
+  if (!tableExists(db, 'sessions') || !tableExists(db, 'chat_messages')) {
+    return;
+  }
+
+  const clearSql = `
+    UPDATE sessions
+    SET last_message_at = NULL,
+        last_message_preview = NULL;
+  `;
+  logAction(actions, clearSql.trim(), 'Reset sessions message metadata before backfill');
+  db.exec(clearSql);
+
+  const sql = `
+    UPDATE sessions
+    SET
+      last_message_at = (
+        SELECT m.createdAt
+        FROM chat_messages m
+        WHERE m.sessionId = sessions.id
+        ORDER BY m.createdAt DESC, m.id DESC
+        LIMIT 1
+      ),
+      last_message_preview = (
+        SELECT substr(m.text, 1, 160)
+        FROM chat_messages m
+        WHERE m.sessionId = sessions.id
+        ORDER BY m.createdAt DESC, m.id DESC
+        LIMIT 1
+      );
+  `;
+  logAction(actions, sql.trim(), 'Backfill sessions last_message_at/preview from chat_messages');
+  db.exec(sql);
+}
+
 function migrateLegacyData(db, actions) {
   const hasSubjects = tableExists(db, 'subjects');
   const hasDocuments = tableExists(db, 'documents');
   const hasEmbeddings = tableExists(db, 'embeddings');
+  const hasChatHistory = tableExists(db, 'chat_history');
 
   if (!hasSubjects && !hasDocuments && !hasEmbeddings) {
     return;
@@ -139,8 +234,8 @@ function migrateLegacyData(db, actions) {
 
   if (hasSubjects && sessionsCount === 0) {
     const sql = `
-      INSERT INTO sessions (id, title, createdAt, updatedAt)
-      SELECT id, name, datetime('now'), datetime('now')
+      INSERT INTO sessions (id, title, createdAt)
+      SELECT id, name, datetime('now')
       FROM subjects;
     `;
     logAction(actions, sql.trim(), 'Migrate subjects -> sessions');
@@ -201,9 +296,20 @@ function migrateLegacyData(db, actions) {
     db.exec(sql);
   }
 
+  const chatMessagesCount = getCount(db, 'chat_messages');
+  if (hasChatHistory && chatMessagesCount === 0) {
+    const sql = `
+      INSERT INTO chat_messages (id, sessionId, role, text, createdAt)
+      SELECT id, sessionId, role, text, COALESCE(createdAt, datetime('now'))
+      FROM chat_history;
+    `;
+    logAction(actions, sql.trim(), 'Migrate chat_history -> chat_messages');
+    db.exec(sql);
+  }
+
   const ensureDefaultSessionSql = `
-    INSERT OR IGNORE INTO sessions (id, title, createdAt, updatedAt)
-    VALUES (1, 'General', datetime('now'), datetime('now'));
+    INSERT OR IGNORE INTO sessions (id, title, createdAt)
+    VALUES (1, 'General', datetime('now'));
   `;
   logAction(actions, ensureDefaultSessionSql.trim(), 'Ensure default session exists');
   db.exec(ensureDefaultSessionSql);
@@ -216,6 +322,9 @@ function runMigrations({ dryRun = false } = {}) {
   const execute = () => {
     ensureNewTables(db, actions);
     migrateLegacyData(db, actions);
+    ensureSessionMetadataColumns(db, actions);
+    normalizeChatMessageTimestamps(db, actions);
+    backfillSessionMessageMetadata(db, actions);
   };
 
   if (dryRun) {

@@ -4,19 +4,18 @@ const multer = require('multer');
 const {
   listSessions,
   createSession,
-  getSessionById,
   assertSessionExists,
-  touchSession,
   deleteSession,
 } = require('../services/sessionService');
 const {
   createPdfRecord,
-  getPdfById,
+  updatePdfStorage,
   listPdfsBySession,
   assertPdfExists,
   deletePdfRecord,
+  getPdfReadinessBySession,
 } = require('../services/pdfRecordService');
-const { saveUploadedPdf, removeStoredPdf } = require('../services/uploadService');
+const { sanitizeFilename, saveUploadedPdfById, removeStoredPdf } = require('../services/uploadService');
 const { addJob, getJob, getQueueState } = require('../services/jobQueue');
 const { runChatQuery, shouldRunAsyncChat, generateSessionQuiz } = require('../services/ragService');
 const { addMessage, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
@@ -29,9 +28,24 @@ const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 50 * 1024 * 1024,
+    fileSize: Number(process.env.MAX_UPLOAD_FILE_SIZE_BYTES) || 50 * 1024 * 1024,
   },
 });
+
+function normalizeMulterError(error) {
+  if (error?.name === 'MulterError') {
+    const err = new Error(
+      error.code === 'LIMIT_FILE_SIZE'
+        ? 'Uploaded file exceeds configured size limit.'
+        : error.message || 'Upload failed.'
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+  if (error) {
+    throw error;
+  }
+}
 
 function parsePositiveInt(value, fieldName) {
   const parsed = Number(value);
@@ -83,7 +97,10 @@ router.delete('/sessions/:sessionId', (req, res) => {
   return ok(res, result);
 });
 
-router.post('/sessions/:sessionId/pdfs', upload.single('file'), async (req, res) => {
+router.post('/sessions/:sessionId/pdfs', (req, res, next) => {
+  upload.single('file')(req, res, async (uploadErr) => {
+    try {
+      normalizeMulterError(uploadErr);
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   assertSessionExists(sessionId);
 
@@ -93,26 +110,38 @@ router.post('/sessions/:sessionId/pdfs', upload.single('file'), async (req, res)
     throw error;
   }
 
-  const { filename, storagePath } = await saveUploadedPdf({
-    sessionId,
-    file: req.file,
-  });
+  // eslint-disable-next-line no-console
+  console.info(`UPLOAD_START sessionId=${sessionId} originalName=${req.file.originalname} size=${req.file.size}`);
 
   const pdf = createPdfRecord({
     sessionId,
-    title: req.body.title,
-    filename,
-    storagePath,
+    title: req.body.title || sanitizeFilename(req.file.originalname || 'uploaded.pdf').replace(/\.pdf$/i, ''),
+    filename: 'pending.pdf',
+    storagePath: '',
     type: 'pdf',
   });
 
-  touchSession(sessionId);
+  try {
+    const { filename, storagePath } = await saveUploadedPdfById({
+      sessionId,
+      pdfId: pdf.id,
+      file: req.file,
+    });
+
+    updatePdfStorage(pdf.id, { filename, storagePath });
+  } catch (error) {
+    deletePdfRecord(pdf.id);
+    throw error;
+  }
 
   addJob({
     type: 'indexPdf',
     pdfId: pdf.id,
-    maxRetries: 2,
+    maxRetries: 3,
   });
+
+  // eslint-disable-next-line no-console
+  console.info(`UPLOAD_DONE sessionId=${sessionId} pdfId=${pdf.id} status=processing`);
 
   return ok(res, {
     pdfId: pdf.id,
@@ -120,6 +149,10 @@ router.post('/sessions/:sessionId/pdfs', upload.single('file'), async (req, res)
     title: pdf.title,
     status: 'processing',
   }, 202);
+    } catch (error) {
+      return next(error);
+    }
+  });
 });
 
 router.get('/pdfs/:pdfId', (req, res) => {
@@ -138,7 +171,6 @@ router.delete('/pdfs/:pdfId', async (req, res) => {
   }
 
   const result = deletePdfRecord(pdfId);
-  touchSession(pdf.sessionId);
   return ok(res, result);
 });
 
@@ -160,6 +192,16 @@ router.post('/sessions/:sessionId/chat', async (req, res) => {
   }
 
   const normalizedHistory = validateHistory(history);
+  const readiness = getPdfReadinessBySession(sessionId);
+  if (readiness.uploaded === 0 || readiness.indexed === 0 || readiness.processing > 0 || readiness.failed > 0) {
+    return res.status(400).json({
+      ok: false,
+      error: 'PDF_NOT_READY',
+    });
+  }
+
+  // eslint-disable-next-line no-console
+  console.info(`CHAT_REQUEST sessionId=${sessionId} messageLength=${message.length}`);
 
   if (shouldRunAsyncChat({ sessionId, history: normalizedHistory })) {
     const job = addJob({
@@ -184,19 +226,15 @@ router.post('/sessions/:sessionId/chat', async (req, res) => {
     history: normalizedHistory,
   });
   recordQuery({ queryTimeMs: Date.now() - startedAt });
+  // eslint-disable-next-line no-console
+  console.info(`CHAT_RESPONSE_TIME sessionId=${sessionId} durationMs=${Date.now() - startedAt}`);
 
   addMessage({ sessionId, role: 'user', text: message });
   addMessage({
     sessionId,
     role: 'assistant',
     text: response.answer,
-    metadata: {
-      sources: response.sources,
-      usedChunksCount: response.usedChunksCount,
-    },
   });
-
-  touchSession(sessionId);
 
   return ok(res, {
     answer: response.answer,
@@ -228,7 +266,9 @@ router.get('/jobs/:jobId', (req, res) => {
 router.get('/sessions/:sessionId/history', (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   assertSessionExists(sessionId);
-  return ok(res, listSessionHistory(sessionId));
+  const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
+  const offset = req.query.offset !== undefined ? Number(req.query.offset) : undefined;
+  return ok(res, listSessionHistory(sessionId, { limit, offset }));
 });
 
 router.delete('/sessions/:sessionId/history', (req, res) => {

@@ -90,4 +90,16 @@ test('chat-first integration flow', async () => {
   assert.equal(history.body.ok, true);
   assert.ok(Array.isArray(history.body.data));
   assert.ok(history.body.data.length >= 2);
+  history.body.data.forEach((message) => {
+    assert.equal(typeof message.id, 'string');
+    assert.ok(['user', 'assistant', 'system'].includes(message.role));
+    assert.equal(typeof message.text, 'string');
+    assert.equal(typeof message.createdAt, 'string');
+    assert.ok(message.createdAt.length > 0);
+  });
+  for (let i = 1; i < history.body.data.length; i += 1) {
+    const prev = new Date(history.body.data[i - 1].createdAt).getTime();
+    const curr = new Date(history.body.data[i].createdAt).getTime();
+    assert.ok(prev <= curr);
+  }
 });

@@ -1,39 +1,92 @@
 const db = require('../db/database');
 
 const insertMessageStmt = db.prepare(`
-  INSERT INTO chat_history (sessionId, role, text, metadata, createdAt)
-  VALUES (@sessionId, @role, @text, @metadata, @createdAt)
+  INSERT INTO chat_messages (sessionId, role, text, createdAt)
+  VALUES (@sessionId, @role, @text, @createdAt)
+`);
+
+const updateSessionMessageMetadataStmt = db.prepare(`
+  UPDATE sessions
+  SET last_message_at = @createdAt,
+      last_message_preview = @lastMessagePreview
+  WHERE id = @sessionId
 `);
 
 const listMessagesStmt = db.prepare(`
-  SELECT id, role, text, createdAt
-  FROM chat_history
-  WHERE sessionId = ?
-  ORDER BY id ASC
+  SELECT
+    id,
+    role,
+    text,
+    COALESCE(NULLIF(createdAt, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) AS createdAt
+  FROM chat_messages
+  WHERE sessionId = @sessionId
+  ORDER BY createdAt ASC, id ASC
+  LIMIT @limit
+  OFFSET @offset
 `);
 
 const deleteMessagesStmt = db.prepare(`
-  DELETE FROM chat_history
+  DELETE FROM chat_messages
   WHERE sessionId = ?
 `);
 
-function addMessage({ sessionId, role, text, metadata = null }) {
-  const createdAt = new Date().toISOString();
+const clearSessionMessageMetadataStmt = db.prepare(`
+  UPDATE sessions
+  SET last_message_at = NULL,
+      last_message_preview = NULL
+  WHERE id = ?
+`);
+
+const addMessageTx = db.transaction(({ sessionId, role, text, createdAt }) => {
   insertMessageStmt.run({
     sessionId,
     role,
     text,
-    metadata: metadata ? JSON.stringify(metadata) : null,
     createdAt,
+  });
+  updateSessionMessageMetadataStmt.run({
+    sessionId,
+    createdAt,
+    lastMessagePreview: String(text).slice(0, 160),
+  });
+});
+
+function addMessage({ sessionId, role, text, createdAt }) {
+  const timestamp = createdAt || new Date().toISOString();
+  addMessageTx({
+    sessionId,
+    role,
+    text,
+    createdAt: timestamp,
   });
 }
 
-function listSessionHistory(sessionId) {
-  return listMessagesStmt.all(sessionId);
+function listSessionHistory(sessionId, options = {}) {
+  const requestedLimit = Number(options.limit ?? 1000);
+  const requestedOffset = Number(options.offset ?? 0);
+  const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, 5000)
+    : 1000;
+  const offset = Number.isInteger(requestedOffset) && requestedOffset >= 0
+    ? requestedOffset
+    : 0;
+
+  return listMessagesStmt
+    .all({ sessionId, limit, offset })
+    .map((row) => ({
+      id: String(row.id),
+      role: row.role,
+      text: row.text,
+      createdAt: row.createdAt,
+    }));
 }
 
 function clearSessionHistory(sessionId) {
-  deleteMessagesStmt.run(sessionId);
+  const clearTx = db.transaction((id) => {
+    deleteMessagesStmt.run(id);
+    clearSessionMessageMetadataStmt.run(id);
+  });
+  clearTx(sessionId);
   return { cleared: true };
 }
 

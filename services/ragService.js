@@ -6,6 +6,7 @@ const {
 } = require('../config/gemini');
 const { generateEmbedding } = require('./embeddingService');
 const { similaritySearch, getChunkCountBySession } = require('./vectorService');
+const { logError } = require('../utils/logger');
 
 const DEFAULT_TOP_K = Number(process.env.RAG_TOP_K) || 5;
 const DEFAULT_CANDIDATE_LIMIT = Number(process.env.RAG_CANDIDATE_LIMIT) || 300;
@@ -33,11 +34,16 @@ async function generateTextWithFallback({ prompt, generationConfig }) {
   for (let i = 0; i < models.length; i += 1) {
     const model = models[i];
     try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: generationConfig,
-      });
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: generationConfig,
+        }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('Gemini request timeout.')), 25_000);
+        }),
+      ]);
 
       return response?.text || '';
     } catch (error) {
@@ -62,10 +68,11 @@ async function generateTextWithFallback({ prompt, generationConfig }) {
 
 async function runChatQuery({ sessionId, message, history = [], topK = DEFAULT_TOP_K }) {
   const queryEmbedding = await generateEmbedding(message);
-  const candidates = similaritySearch({
+  const normalizedTopK = Math.max(1, Math.min(5, Number(topK) || DEFAULT_TOP_K));
+  const candidates = await similaritySearch({
     sessionId,
     queryEmbedding,
-    topK,
+    topK: normalizedTopK,
     limit: DEFAULT_CANDIDATE_LIMIT,
     offset: 0,
   });
@@ -84,13 +91,21 @@ async function runChatQuery({ sessionId, message, history = [], topK = DEFAULT_T
 
   const prompt = `You are a PDF analysis assistant.\nUse ONLY the provided context chunks and chat history.\nIf the answer is not found in context, reply exactly: I don't know - please provide more context.\n\nRecent chat history:\n${formatHistory(history)}\n\nUser message:\n${message}\n\nContext:\n${context}`;
 
-  const answer = (await generateTextWithFallback({ prompt })) || "I don't know - please provide more context.";
+  let answer = "I don't know - please provide more context.";
+  try {
+    answer = (await generateTextWithFallback({ prompt })) || answer;
+  } catch (error) {
+    logError('ERROR_QUEUE', error, {
+      service: 'ragService',
+      stage: 'runChatQueryGeneration',
+      sessionId,
+    });
+  }
 
   return {
     answer,
     sources: candidates.map((chunk) => ({
       pdfId: chunk.pdfId,
-      page: null,
       chunkId: chunk.chunkId,
       score: chunk.score,
     })),

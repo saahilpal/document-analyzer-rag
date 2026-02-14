@@ -4,7 +4,7 @@ const { chunkText } = require('./chunkService');
 const { generateEmbeddings } = require('./embeddingService');
 const { addChunks } = require('./vectorService');
 const { getPdfById, markPdfIndexed, markPdfFailed } = require('./pdfRecordService');
-const { touchSession } = require('./sessionService');
+const { logInfo, logError } = require('../utils/logger');
 
 const TOKEN_TO_CHAR_RATIO = Number(process.env.RAG_TOKEN_TO_CHAR_RATIO) || 4;
 const DEFAULT_CHUNK_TOKENS = Number(process.env.RAG_CHUNK_TOKENS) || 1000;
@@ -83,7 +83,12 @@ async function indexPdfById(pdfId) {
     });
 
     markPdfIndexed(pdfId, inserted);
-    touchSession(pdf.sessionId);
+    logInfo('INDEX_DONE', {
+      pdfId,
+      sessionId: pdf.sessionId,
+      indexedChunks: inserted,
+      status: 'indexed',
+    });
 
     return {
       indexedChunks: inserted,
@@ -92,6 +97,11 @@ async function indexPdfById(pdfId) {
     };
   } catch (error) {
     markPdfFailed(pdfId);
+    logError('ERROR_QUEUE', error, {
+      pdfId,
+      sessionId: pdf.sessionId,
+      stage: 'indexPdfById',
+    });
     throw error;
   }
 }

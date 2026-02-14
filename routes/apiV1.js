@@ -15,13 +15,21 @@ const {
   deletePdfRecord,
   getPdfReadinessBySession,
 } = require('../services/pdfRecordService');
-const { sanitizeFilename, saveUploadedPdfById, removeStoredPdf } = require('../services/uploadService');
+const {
+  uploadsRoot,
+  sanitizeFilename,
+  saveUploadedPdfById,
+  removeStoredPdf,
+} = require('../services/uploadService');
 const { addJob, getJob, getQueueState } = require('../services/jobQueue');
 const { runChatQuery, shouldRunAsyncChat, generateSessionQuiz } = require('../services/ragService');
-const { addMessage, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
+const { addConversation, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
 const { getRecentContextTextsBySession } = require('../services/vectorService');
 const { getMetrics, recordQuery } = require('../services/metricsService');
-const { ok } = require('./helpers');
+const { ok, fail } = require('./helpers');
+const asyncHandler = require('../utils/asyncHandler');
+const { createHttpError } = require('../utils/errors');
+const { logInfo, logError } = require('../utils/logger');
 
 const router = express.Router();
 
@@ -50,9 +58,7 @@ function normalizeMulterError(error) {
 function parsePositiveInt(value, fieldName) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    const error = new Error(`${fieldName} must be a positive integer.`);
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, `${fieldName} must be a positive integer.`);
   }
   return parsed;
 }
@@ -64,7 +70,16 @@ function validateHistory(history) {
 
   return history
     .filter((entry) => entry && (entry.role === 'user' || entry.role === 'assistant') && typeof entry.text === 'string')
-    .map((entry) => ({ role: entry.role, text: entry.text }));
+    .map((entry) => ({ role: entry.role, text: entry.text.trim() }))
+    .filter((entry) => entry.text.length > 0);
+}
+
+function normalizeOptionalTitle(title, fallback) {
+  const normalized = String(title || '').trim();
+  if (normalized) {
+    return normalized;
+  }
+  return sanitizeFilename(fallback || 'uploaded.pdf').replace(/\.pdf$/i, '');
 }
 
 router.get('/health', (req, res) => ok(res, { status: 'ok', service: 'StudyRAG Backend' }));
@@ -73,11 +88,9 @@ router.get('/ping', (req, res) => ok(res, { pong: true }));
 router.get('/sessions', (req, res) => ok(res, listSessions()));
 
 router.post('/sessions', (req, res) => {
-  const { title } = req.body;
-  if (!title || typeof title !== 'string') {
-    const error = new Error('title is required and must be a string.');
-    error.statusCode = 400;
-    throw error;
+  const title = String(req.body?.title || '').trim();
+  if (!title) {
+    throw createHttpError(400, 'title is required and must be a string.');
   }
 
   const session = createSession(title);
@@ -101,54 +114,57 @@ router.post('/sessions/:sessionId/pdfs', (req, res, next) => {
   upload.single('file')(req, res, async (uploadErr) => {
     try {
       normalizeMulterError(uploadErr);
-  const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  assertSessionExists(sessionId);
+      const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
+      assertSessionExists(sessionId);
 
-  if (!req.file) {
-    const error = new Error('file is required as multipart form-data.');
-    error.statusCode = 400;
-    throw error;
-  }
+      if (!req.file) {
+        throw createHttpError(400, 'file is required as multipart form-data.');
+      }
 
-  // eslint-disable-next-line no-console
-  console.info(`UPLOAD_START sessionId=${sessionId} originalName=${req.file.originalname} size=${req.file.size}`);
+      logInfo('UPLOAD_START', {
+        route: '/api/v1/sessions/:sessionId/pdfs',
+        sessionId,
+        originalName: req.file.originalname,
+        fileSize: req.file.size,
+      });
 
-  const pdf = createPdfRecord({
-    sessionId,
-    title: req.body.title || sanitizeFilename(req.file.originalname || 'uploaded.pdf').replace(/\.pdf$/i, ''),
-    filename: 'pending.pdf',
-    storagePath: '',
-    type: 'pdf',
-  });
+      const pdf = createPdfRecord({
+        sessionId,
+        title: normalizeOptionalTitle(req.body.title, req.file.originalname),
+        filename: 'pending.pdf',
+        storagePath: '',
+        type: 'pdf',
+      });
 
-  try {
-    const { filename, storagePath } = await saveUploadedPdfById({
-      sessionId,
-      pdfId: pdf.id,
-      file: req.file,
-    });
+      try {
+        const { filename, storagePath } = await saveUploadedPdfById({
+          sessionId,
+          pdfId: pdf.id,
+          file: req.file,
+        });
 
-    updatePdfStorage(pdf.id, { filename, storagePath });
-  } catch (error) {
-    deletePdfRecord(pdf.id);
-    throw error;
-  }
+        updatePdfStorage(pdf.id, { filename, storagePath });
+      } catch (error) {
+        logError('ERROR_UPLOAD', error, {
+          route: '/api/v1/sessions/:sessionId/pdfs',
+          sessionId,
+        });
+        deletePdfRecord(pdf.id);
+        throw error;
+      }
 
-  addJob({
-    type: 'indexPdf',
-    pdfId: pdf.id,
-    maxRetries: 3,
-  });
+      addJob({
+        type: 'indexPdf',
+        pdfId: pdf.id,
+        maxRetries: 3,
+      });
 
-  // eslint-disable-next-line no-console
-  console.info(`UPLOAD_DONE sessionId=${sessionId} pdfId=${pdf.id} status=processing`);
-
-  return ok(res, {
-    pdfId: pdf.id,
-    sessionId,
-    title: pdf.title,
-    status: 'processing',
-  }, 202);
+      return ok(res, {
+        pdfId: pdf.id,
+        sessionId,
+        title: pdf.title,
+        status: 'processing',
+      }, 202);
     } catch (error) {
       return next(error);
     }
@@ -161,18 +177,25 @@ router.get('/pdfs/:pdfId', (req, res) => {
   return ok(res, pdf);
 });
 
-router.delete('/pdfs/:pdfId', async (req, res) => {
+router.delete('/pdfs/:pdfId', asyncHandler(async (req, res) => {
   const pdfId = parsePositiveInt(req.params.pdfId, 'pdfId');
   const removeFile = String(req.query.removeFile || 'false').toLowerCase() === 'true';
 
   const pdf = assertPdfExists(pdfId);
   if (removeFile) {
-    await removeStoredPdf(pdf.path).catch(() => null);
+    try {
+      await removeStoredPdf(pdf.path);
+    } catch (error) {
+      logError('ERROR_UPLOAD', error, {
+        route: '/api/v1/pdfs/:pdfId',
+        pdfId,
+      });
+    }
   }
 
   const result = deletePdfRecord(pdfId);
   return ok(res, result);
-});
+}));
 
 router.get('/sessions/:sessionId/pdfs', (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
@@ -180,28 +203,27 @@ router.get('/sessions/:sessionId/pdfs', (req, res) => {
   return ok(res, listPdfsBySession(sessionId));
 });
 
-router.post('/sessions/:sessionId/chat', async (req, res) => {
+router.post('/sessions/:sessionId/chat', asyncHandler(async (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   const session = assertSessionExists(sessionId);
-  const { message, history } = req.body;
+  const message = String(req.body?.message || '').trim();
+  const { history } = req.body;
 
-  if (!message || typeof message !== 'string') {
-    const error = new Error('message is required and must be a string.');
-    error.statusCode = 400;
-    throw error;
+  if (!message) {
+    throw createHttpError(400, 'message is required and must be a string.');
   }
 
   const normalizedHistory = validateHistory(history);
   const readiness = getPdfReadinessBySession(sessionId);
   if (readiness.uploaded === 0 || readiness.indexed === 0 || readiness.processing > 0 || readiness.failed > 0) {
-    return res.status(400).json({
-      ok: false,
-      error: 'PDF_NOT_READY',
-    });
+    return fail(res, 'PDF_NOT_READY', 400);
   }
 
-  // eslint-disable-next-line no-console
-  console.info(`CHAT_REQUEST sessionId=${sessionId} messageLength=${message.length}`);
+  logInfo('CHAT_REQUEST', {
+    route: '/api/v1/sessions/:sessionId/chat',
+    sessionId,
+    messageLength: message.length,
+  });
 
   if (shouldRunAsyncChat({ sessionId, history: normalizedHistory })) {
     const job = addJob({
@@ -225,16 +247,20 @@ router.post('/sessions/:sessionId/chat', async (req, res) => {
     message,
     history: normalizedHistory,
   });
-  recordQuery({ queryTimeMs: Date.now() - startedAt });
-  // eslint-disable-next-line no-console
-  console.info(`CHAT_RESPONSE_TIME sessionId=${sessionId} durationMs=${Date.now() - startedAt}`);
-
-  addMessage({ sessionId, role: 'user', text: message });
-  addMessage({
-    sessionId,
-    role: 'assistant',
-    text: response.answer,
-  });
+  const durationMs = Date.now() - startedAt;
+  recordQuery({ queryTimeMs: durationMs });
+  try {
+    addConversation({
+      sessionId,
+      userText: message,
+      assistantText: response.answer,
+    });
+  } catch (error) {
+    logError('ERROR_DB', error, {
+      route: '/api/v1/sessions/:sessionId/chat',
+      sessionId,
+    });
+  }
 
   return ok(res, {
     answer: response.answer,
@@ -242,14 +268,12 @@ router.post('/sessions/:sessionId/chat', async (req, res) => {
     usedChunksCount: response.usedChunksCount,
     sessionTitle: session.title,
   });
-});
+}));
 
 router.get('/jobs/:jobId', (req, res) => {
   const job = getJob(req.params.jobId);
   if (!job) {
-    const error = new Error('jobId does not exist.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'jobId does not exist.');
   }
 
   return ok(res, {
@@ -277,21 +301,17 @@ router.delete('/sessions/:sessionId/history', (req, res) => {
   return ok(res, clearSessionHistory(sessionId));
 });
 
-router.post('/sessions/:sessionId/quiz', async (req, res) => {
+router.post('/sessions/:sessionId/quiz', asyncHandler(async (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   const session = assertSessionExists(sessionId);
 
   const difficulty = String(req.body.difficulty || 'medium').toLowerCase();
   const count = Number(req.body.count || 5);
   if (!['easy', 'medium', 'hard'].includes(difficulty)) {
-    const error = new Error('difficulty must be one of: easy, medium, hard.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'difficulty must be one of: easy, medium, hard.');
   }
   if (!Number.isInteger(count) || count < 1 || count > 20) {
-    const error = new Error('count must be an integer between 1 and 20.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'count must be an integer between 1 and 20.');
   }
 
   const contextText = getRecentContextTextsBySession(sessionId, 24).join('\n\n');
@@ -303,13 +323,11 @@ router.post('/sessions/:sessionId/quiz', async (req, res) => {
   });
 
   return ok(res, quiz);
-});
+}));
 
 router.get('/admin/queue', (req, res) => {
   if (process.env.NODE_ENV === 'production') {
-    const error = new Error('Admin queue endpoint is disabled in production.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'Admin queue endpoint is disabled in production.');
   }
 
   return ok(res, {
@@ -318,15 +336,17 @@ router.get('/admin/queue', (req, res) => {
   });
 });
 
-router.post('/admin/reset', async (req, res) => {
+router.post('/admin/reset', asyncHandler(async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
-    const error = new Error('Admin reset endpoint is disabled in production.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'Admin reset endpoint is disabled in production.');
   }
 
-  await fs.rm('data/uploads', { recursive: true, force: true }).catch(() => null);
+  await fs.rm(uploadsRoot, { recursive: true, force: true }).catch((error) => {
+    logError('ERROR_UPLOAD', error, {
+      route: '/api/v1/admin/reset',
+    });
+  });
   return ok(res, { reset: true });
-});
+}));
 
 module.exports = router;

@@ -1,4 +1,5 @@
 const db = require('../db/database');
+const ALLOWED_ROLES = new Set(['user', 'assistant', 'system']);
 
 const insertMessageStmt = db.prepare(`
   INSERT INTO chat_messages (sessionId, role, text, createdAt)
@@ -51,13 +52,67 @@ const addMessageTx = db.transaction(({ sessionId, role, text, createdAt }) => {
   });
 });
 
+const addConversationTx = db.transaction(({ sessionId, userText, assistantText, userCreatedAt, assistantCreatedAt }) => {
+  insertMessageStmt.run({
+    sessionId,
+    role: 'user',
+    text: userText,
+    createdAt: userCreatedAt,
+  });
+
+  insertMessageStmt.run({
+    sessionId,
+    role: 'assistant',
+    text: assistantText,
+    createdAt: assistantCreatedAt,
+  });
+
+  updateSessionMessageMetadataStmt.run({
+    sessionId,
+    createdAt: assistantCreatedAt,
+    lastMessagePreview: String(assistantText).slice(0, 160),
+  });
+});
+
+function normalizeMessageText(text) {
+  const normalizedText = String(text || '').trim();
+  if (!normalizedText) {
+    const error = new Error('Chat message text is required.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalizedText;
+}
+
 function addMessage({ sessionId, role, text, createdAt }) {
+  if (!ALLOWED_ROLES.has(role)) {
+    const error = new Error('Invalid chat role.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const normalizedText = normalizeMessageText(text);
+
   const timestamp = createdAt || new Date().toISOString();
   addMessageTx({
     sessionId,
     role,
-    text,
+    text: normalizedText,
     createdAt: timestamp,
+  });
+}
+
+function addConversation({ sessionId, userText, assistantText, createdAt }) {
+  const normalizedUserText = normalizeMessageText(userText);
+  const normalizedAssistantText = normalizeMessageText(assistantText);
+  const userCreatedAt = createdAt || new Date().toISOString();
+  const assistantCreatedAt = new Date(new Date(userCreatedAt).getTime() + 1).toISOString();
+
+  addConversationTx({
+    sessionId,
+    userText: normalizedUserText,
+    assistantText: normalizedAssistantText,
+    userCreatedAt,
+    assistantCreatedAt,
   });
 }
 
@@ -92,6 +147,7 @@ function clearSessionHistory(sessionId) {
 
 module.exports = {
   addMessage,
+  addConversation,
   listSessionHistory,
   clearSessionHistory,
 };

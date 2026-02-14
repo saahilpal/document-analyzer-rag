@@ -5,7 +5,6 @@ const {
   createSession,
   assertSessionExists,
   deleteSession,
-  touchSession,
 } = require('../services/sessionService');
 const {
   createPdfRecord,
@@ -13,21 +12,22 @@ const {
   assertPdfExists,
   deletePdfRecord,
 } = require('../services/pdfRecordService');
-const { uploadsRoot } = require('../services/uploadService');
+const { uploadsRoot, isPathWithinUploadsRoot } = require('../services/uploadService');
 const { addJob } = require('../services/jobQueue');
 const { runChatQuery, generateSessionQuiz } = require('../services/ragService');
-const { addMessage } = require('../services/chatHistoryService');
+const { addConversation } = require('../services/chatHistoryService');
 const { getRecentContextTextsBySession } = require('../services/vectorService');
-const { setDeprecationHeaders } = require('./helpers');
+const { ok, setDeprecationHeaders } = require('./helpers');
+const asyncHandler = require('../utils/asyncHandler');
+const { createHttpError } = require('../utils/errors');
+const { logInfo, logError } = require('../utils/logger');
 
 const router = express.Router();
 
 function parseId(value, fieldName) {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) {
-    const error = new Error(`${fieldName} must be a positive integer.`);
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, `${fieldName} must be a positive integer.`);
   }
   return id;
 }
@@ -35,26 +35,24 @@ function parseId(value, fieldName) {
 router.get('/subjects', (req, res) => {
   setDeprecationHeaders(res, '/api/v1/sessions');
   const sessions = listSessions().map((session) => ({ id: session.id, name: session.title }));
-  return res.status(200).json(sessions);
+  return ok(res, sessions);
 });
 
 router.post('/subjects', (req, res) => {
   setDeprecationHeaders(res, '/api/v1/sessions');
-  const { name } = req.body;
-  if (!name || typeof name !== 'string') {
-    const error = new Error('name is required and must be a string.');
-    error.statusCode = 400;
-    throw error;
+  const name = String(req.body?.name || '').trim();
+  if (!name) {
+    throw createHttpError(400, 'name is required and must be a string.');
   }
 
   const created = createSession(name);
-  return res.status(200).json({ id: created.id, name: created.title });
+  return ok(res, { id: created.id, name: created.title });
 });
 
 router.delete('/subjects/:id', (req, res) => {
   setDeprecationHeaders(res, '/api/v1/sessions/:sessionId');
   const sessionId = parseId(req.params.id, 'id');
-  return res.status(200).json(deleteSession(sessionId));
+  return ok(res, deleteSession(sessionId));
 });
 
 router.get('/subjects/:subjectId/documents', (req, res) => {
@@ -66,7 +64,7 @@ router.get('/subjects/:subjectId/documents', (req, res) => {
     title: pdf.title,
     type: pdf.type,
   }));
-  return res.status(200).json(docs);
+  return ok(res, docs);
 });
 
 router.post('/documents', (req, res) => {
@@ -80,23 +78,25 @@ router.post('/documents', (req, res) => {
   const relativePath = String(req.body.path || '').trim();
 
   if (!title || !type || !relativePath) {
-    const error = new Error('subjectId, title, type, and path are required.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'subjectId, title, type, and path are required.');
   }
 
   if (path.isAbsolute(relativePath)) {
-    const error = new Error('Legacy path must be relative under data/uploads.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'Legacy path must be relative under data/uploads.');
   }
 
   const resolved = path.resolve(uploadsRoot, relativePath);
-  const uploadsRootResolved = path.resolve(uploadsRoot);
-  if (!resolved.startsWith(uploadsRootResolved)) {
-    const error = new Error('Legacy path is outside allowed uploads directory.');
-    error.statusCode = 400;
-    throw error;
+  const relativeToRoot = path.relative(uploadsRoot, resolved);
+  if (
+    relativePath.includes('\0') ||
+    relativeToRoot.startsWith('..') ||
+    path.isAbsolute(relativeToRoot) ||
+    !isPathWithinUploadsRoot(resolved)
+  ) {
+    throw createHttpError(400, 'Legacy path is outside allowed uploads directory.');
+  }
+  if (path.extname(resolved).toLowerCase() !== '.pdf') {
+    throw createHttpError(400, 'Legacy path must point to a PDF file.');
   }
 
   const filename = path.basename(resolved);
@@ -114,9 +114,7 @@ router.post('/documents', (req, res) => {
     maxRetries: 1,
   });
 
-  touchSession(sessionId);
-
-  return res.status(200).json({
+  return ok(res, {
     id: pdf.id,
     subjectId: pdf.sessionId,
     title: pdf.title,
@@ -129,23 +127,21 @@ router.post('/documents', (req, res) => {
 router.delete('/documents/:id', (req, res) => {
   setDeprecationHeaders(res, '/api/v1/pdfs/:pdfId');
   const pdfId = parseId(req.params.id, 'id');
-  const pdf = assertPdfExists(pdfId);
+  assertPdfExists(pdfId);
   deletePdfRecord(pdfId);
-  touchSession(pdf.sessionId);
-  return res.status(200).json({ deleted: true, id: pdfId });
+  return ok(res, { deleted: true, id: pdfId });
 });
 
-router.post('/rag/query', async (req, res) => {
+router.post('/rag/query', asyncHandler(async (req, res) => {
   setDeprecationHeaders(res, '/api/v1/sessions/:sessionId/chat');
   const sessionId = parseId(req.body.subjectId, 'subjectId');
   assertSessionExists(sessionId);
 
   const question = String(req.body.question || '').trim();
   if (!question) {
-    const error = new Error('question is required.');
-    error.statusCode = 400;
-    throw error;
+    throw createHttpError(400, 'question is required.');
   }
+  logInfo('CHAT_REQUEST', { route: 'legacy/rag/query', sessionId, messageLength: question.length });
 
   const response = await runChatQuery({
     sessionId,
@@ -153,20 +149,35 @@ router.post('/rag/query', async (req, res) => {
     history: Array.isArray(req.body.history) ? req.body.history : [],
   });
 
-  addMessage({ sessionId, role: 'user', text: question });
-  addMessage({ sessionId, role: 'assistant', text: response.answer, metadata: { sources: response.sources } });
-  touchSession(sessionId);
+  try {
+    addConversation({
+      sessionId,
+      userText: question,
+      assistantText: response.answer,
+    });
+  } catch (error) {
+    logError('ERROR_DB', error, {
+      route: 'legacy/rag/query',
+      sessionId,
+    });
+  }
 
-  return res.status(200).json({ answer: response.answer });
-});
+  return ok(res, { answer: response.answer });
+}));
 
-router.post('/rag/quiz', async (req, res) => {
+router.post('/rag/quiz', asyncHandler(async (req, res) => {
   setDeprecationHeaders(res, '/api/v1/sessions/:sessionId/quiz');
   const sessionId = parseId(req.body.subjectId, 'subjectId');
   const session = assertSessionExists(sessionId);
 
   const difficulty = String(req.body.difficulty || 'medium').toLowerCase();
   const count = Number(req.body.count || req.body.numQuestions || 5);
+  if (!['easy', 'medium', 'hard'].includes(difficulty)) {
+    throw createHttpError(400, 'difficulty must be one of: easy, medium, hard.');
+  }
+  if (!Number.isInteger(count) || count < 1 || count > 20) {
+    throw createHttpError(400, 'count must be an integer between 1 and 20.');
+  }
   const contextText = getRecentContextTextsBySession(sessionId, 24).join('\n\n');
 
   const quiz = await generateSessionQuiz({
@@ -176,7 +187,7 @@ router.post('/rag/quiz', async (req, res) => {
     count,
   });
 
-  return res.status(200).json(quiz);
-});
+  return ok(res, quiz);
+}));
 
 module.exports = router;

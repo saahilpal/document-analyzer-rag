@@ -6,8 +6,12 @@ const dataDir = path.join(process.cwd(), 'data');
 const dbPath = path.join(dataDir, 'studyrag.sqlite');
 
 function ensureDataDir() {
-  if (!fs.existsSync(dataDir)) {
+  try {
     fs.mkdirSync(dataDir, { recursive: true });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') {
+      throw error;
+    }
   }
 }
 

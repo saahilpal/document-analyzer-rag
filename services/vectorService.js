@@ -1,8 +1,9 @@
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db/database');
 
-const EMBEDDING_CACHE_LIMIT = 400;
-const embeddingCache = new Map();
+const MAX_PDF_CACHE_ENTRIES = 64;
+const MAX_CHUNK_CACHE_ENTRIES_PER_PDF = 200;
+const embeddingCacheByPdf = new Map();
 
 const insertChunkStmt = db.prepare(`
   INSERT INTO chunks (id, sessionId, pdfId, text, embedding, embeddingVectorLength, createdAt)
@@ -31,26 +32,47 @@ const selectRecentTextsBySessionStmt = db.prepare(`
   LIMIT ?
 `);
 
-function setCache(id, vector) {
-  if (embeddingCache.has(id)) {
-    embeddingCache.delete(id);
-  }
-  embeddingCache.set(id, vector);
+function setPdfChunkCache(pdfId, chunkId, vector) {
+  const normalizedPdfId = String(pdfId || 'unknown');
+  let pdfCache = embeddingCacheByPdf.get(normalizedPdfId);
 
-  while (embeddingCache.size > EMBEDDING_CACHE_LIMIT) {
-    const oldestKey = embeddingCache.keys().next().value;
-    embeddingCache.delete(oldestKey);
+  if (!pdfCache) {
+    pdfCache = new Map();
+    embeddingCacheByPdf.set(normalizedPdfId, pdfCache);
+  } else {
+    embeddingCacheByPdf.delete(normalizedPdfId);
+    embeddingCacheByPdf.set(normalizedPdfId, pdfCache);
+  }
+
+  if (pdfCache.has(chunkId)) {
+    pdfCache.delete(chunkId);
+  }
+  pdfCache.set(chunkId, vector);
+
+  while (pdfCache.size > MAX_CHUNK_CACHE_ENTRIES_PER_PDF) {
+    const oldestChunkId = pdfCache.keys().next().value;
+    pdfCache.delete(oldestChunkId);
+  }
+
+  while (embeddingCacheByPdf.size > MAX_PDF_CACHE_ENTRIES) {
+    const oldestPdfId = embeddingCacheByPdf.keys().next().value;
+    embeddingCacheByPdf.delete(oldestPdfId);
   }
 }
 
-function getCachedVector(id) {
-  if (!embeddingCache.has(id)) {
+function getCachedVector(pdfId, chunkId) {
+  const normalizedPdfId = String(pdfId || 'unknown');
+  const pdfCache = embeddingCacheByPdf.get(normalizedPdfId);
+  if (!pdfCache || !pdfCache.has(chunkId)) {
     return null;
   }
 
-  const value = embeddingCache.get(id);
-  embeddingCache.delete(id);
-  embeddingCache.set(id, value);
+  const value = pdfCache.get(chunkId);
+  pdfCache.delete(chunkId);
+  pdfCache.set(chunkId, value);
+  embeddingCacheByPdf.delete(normalizedPdfId);
+  embeddingCacheByPdf.set(normalizedPdfId, pdfCache);
+
   return value;
 }
 
@@ -99,7 +121,7 @@ function cosineSimilarity(a, b) {
 }
 
 function parseVectorForChunk(chunk) {
-  const cached = getCachedVector(chunk.id);
+  const cached = getCachedVector(chunk.pdfId, chunk.id);
   if (cached) {
     return cached;
   }
@@ -107,7 +129,7 @@ function parseVectorForChunk(chunk) {
   try {
     const parsed = JSON.parse(chunk.embedding);
     if (Array.isArray(parsed)) {
-      setCache(chunk.id, parsed);
+      setPdfChunkCache(chunk.pdfId, chunk.id, parsed);
       return parsed;
     }
     return null;
@@ -116,26 +138,33 @@ function parseVectorForChunk(chunk) {
   }
 }
 
-function similaritySearch({ sessionId, queryEmbedding, topK = 5, limit = 300, offset = 0 }) {
+async function similaritySearch({ sessionId, queryEmbedding, topK = 5, limit = 300, offset = 0 }) {
   const rows = selectChunksBySessionStmt.all(sessionId, limit, offset);
+  const normalizedTopK = Math.max(1, Math.min(5, Number(topK) || 5));
 
-  return rows
-    .map((row) => {
-      const vector = parseVectorForChunk(row);
-      if (!vector) {
-        return null;
-      }
+  return new Promise((resolve) => {
+    setImmediate(() => {
+      const result = rows
+        .map((row) => {
+          const vector = parseVectorForChunk(row);
+          if (!vector) {
+            return null;
+          }
 
-      return {
-        chunkId: row.id,
-        pdfId: row.pdfId,
-        text: row.text,
-        score: cosineSimilarity(queryEmbedding, vector),
-      };
-    })
-    .filter((item) => item && Number.isFinite(item.score) && item.score >= 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
+          return {
+            chunkId: row.id,
+            pdfId: row.pdfId,
+            text: row.text,
+            score: cosineSimilarity(queryEmbedding, vector),
+          };
+        })
+        .filter((item) => item && Number.isFinite(item.score) && item.score >= 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, normalizedTopK);
+
+      resolve(result);
+    });
+  });
 }
 
 function getChunkCountBySession(sessionId) {
@@ -149,10 +178,15 @@ function getRecentContextTextsBySession(sessionId, limit = 20) {
     .filter(Boolean);
 }
 
+function invalidatePdfCache(pdfId) {
+  embeddingCacheByPdf.delete(String(pdfId || 'unknown'));
+}
+
 module.exports = {
   addChunks,
   similaritySearch,
   getChunkCountBySession,
   getRecentContextTextsBySession,
+  invalidatePdfCache,
   cosineSimilarity,
 };

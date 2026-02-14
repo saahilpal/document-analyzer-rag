@@ -9,17 +9,19 @@ const listSessionsStmt = db.prepare(`
     s.createdAt,
     s.last_message_at AS lastMessageAt,
     COALESCE(s.last_message_preview, '') AS lastMessagePreview,
-    (
-      SELECT COUNT(*)
-      FROM chat_messages cm
-      WHERE cm.sessionId = s.id
-    ) AS messageCount,
-    (
-      SELECT COUNT(*)
-      FROM pdfs p
-      WHERE p.sessionId = s.id
-    ) AS pdfCount
+    COALESCE(cm.messageCount, 0) AS messageCount,
+    COALESCE(pc.pdfCount, 0) AS pdfCount
   FROM sessions s
+  LEFT JOIN (
+    SELECT sessionId, COUNT(*) AS messageCount
+    FROM chat_messages
+    GROUP BY sessionId
+  ) cm ON cm.sessionId = s.id
+  LEFT JOIN (
+    SELECT sessionId, COUNT(*) AS pdfCount
+    FROM pdfs
+    GROUP BY sessionId
+  ) pc ON pc.sessionId = s.id
   ORDER BY (s.last_message_at IS NULL) ASC, s.last_message_at DESC, s.id DESC
 `);
 
@@ -75,9 +77,16 @@ function getSessionById(sessionId) {
 }
 
 function createSession(title) {
+  const normalizedTitle = String(title || '').trim();
+  if (!normalizedTitle) {
+    const error = new Error('title is required and must be a string.');
+    error.statusCode = 400;
+    throw error;
+  }
+
   const now = new Date().toISOString();
   const payload = {
-    title: title.trim(),
+    title: normalizedTitle,
     createdAt: now,
   };
   if (hasUpdatedAtColumn) {

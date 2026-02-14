@@ -1,4 +1,5 @@
 let extractorPromise = null;
+const { logInfo } = require('../utils/logger');
 
 const DEFAULT_BATCH_SIZE = Number(process.env.LOCAL_EMBEDDING_BATCH_SIZE) || 24;
 const MIN_BATCH_SIZE = Number(process.env.LOCAL_EMBEDDING_BATCH_SIZE_MIN) || 8;
@@ -11,12 +12,10 @@ async function getExtractor() {
 
   // Keep CommonJS project-wide while loading ESM-only transformers package lazily.
   extractorPromise = (async () => {
-    // eslint-disable-next-line no-console
-    console.log('Loading local embedding model...');
+    logInfo('INDEX_DONE', { component: 'embeddingService', stage: 'model_load_start' });
     const { pipeline } = await import('@xenova/transformers');
     const extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
-    // eslint-disable-next-line no-console
-    console.log('Local embedding model loaded.');
+    logInfo('INDEX_DONE', { component: 'embeddingService', stage: 'model_load_done' });
     return extractor;
   })();
 

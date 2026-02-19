@@ -20,8 +20,10 @@ const {
 const {
   uploadsRoot,
   sanitizeFilename,
+  ensureTempUploadDir,
   saveUploadedPdfById,
   removeStoredPdf,
+  removeTempUpload,
 } = require('../services/uploadService');
 const { addJob, getJob, getQueueState } = require('../services/jobQueue');
 const { runChatQuery, shouldRunAsyncChat } = require('../services/ragService');
@@ -37,7 +39,18 @@ const { logInfo, logError } = require('../utils/logger');
 const router = express.Router();
 
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination(req, file, cb) {
+      ensureTempUploadDir()
+        .then((tempDir) => cb(null, tempDir))
+        .catch((error) => cb(error));
+    },
+    filename(req, file, cb) {
+      const timestamp = Date.now();
+      const randomSuffix = Math.random().toString(16).slice(2, 10);
+      cb(null, `${timestamp}_${randomSuffix}_${sanitizeFilename(file.originalname || 'upload.pdf')}`);
+    },
+  }),
   limits: {
     fileSize: Number(process.env.MAX_UPLOAD_FILE_SIZE_BYTES) || 50 * 1024 * 1024,
   },
@@ -164,6 +177,7 @@ router.delete('/sessions/:sessionId', writeLimiter, (req, res) => {
 
 router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
   upload.single('file')(req, res, async (uploadErr) => {
+    let tempFilePath = '';
     try {
       normalizeMulterError(uploadErr);
       const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
@@ -172,6 +186,7 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
       if (!req.file) {
         throw createHttpError(400, 'MISSING_UPLOAD_FILE', 'file is required as multipart form-data.');
       }
+      tempFilePath = req.file.path;
 
       logInfo('UPLOAD_START', {
         route: '/api/v1/sessions/:sessionId/pdfs',
@@ -218,6 +233,12 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
         status: 'processing',
       }, 202);
     } catch (error) {
+      await removeTempUpload(tempFilePath).catch((cleanupError) => {
+        logError('ERROR_UPLOAD', cleanupError, {
+          route: '/api/v1/sessions/:sessionId/pdfs',
+          stage: 'cleanupTempUpload',
+        });
+      });
       return next(error);
     }
   });

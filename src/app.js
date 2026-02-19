@@ -2,62 +2,77 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const morgan = require('morgan');
 
 require('./db/database');
 
 const apiV1Route = require('./routes/apiV1');
-const legacyRoute = require('./routes/legacy');
 const rateLimiter = require('./middleware/rateLimiter');
-const { ok, fail } = require('./routes/helpers');
-const { normalizeHttpError } = require('./utils/errors');
+const { fail } = require('./routes/helpers');
+const { createHttpError, normalizeHttpError } = require('./utils/errors');
 const { logError } = require('./utils/logger');
 
 const app = express();
 
-const allowedOrigins = [
+const DEFAULT_ALLOWED_ORIGIN_PATTERNS = [
   /^http:\/\/localhost(:\d+)?$/i,
   /^http:\/\/127\.0\.0\.1(:\d+)?$/i,
-  /^http:\/\/10\.0\.2\.2(:\d+)?$/i,
-  /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/i,
-  /^http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/i,
-  /^http:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+(:\d+)?$/i,
+  /^https:\/\/localhost(:\d+)?$/i,
+  /^https:\/\/127\.0\.0\.1(:\d+)?$/i,
 ];
 
-function isAllowedOrigin(origin) {
+function parseConfiguredOrigins(rawOrigins) {
+  return String(rawOrigins || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const configuredOrigins = parseConfiguredOrigins(process.env.CORS_ALLOWED_ORIGINS);
+const hasConfiguredOrigins = configuredOrigins.length > 0;
+
+function isAllowedOrigin(origin, normalizedOrigin) {
   if (!origin) {
     return true;
   }
-  return allowedOrigins.some((rule) => rule.test(origin));
+
+  if (hasConfiguredOrigins) {
+    return configuredOrigins.includes(normalizedOrigin);
+  }
+
+  return DEFAULT_ALLOWED_ORIGIN_PATTERNS.some((rule) => rule.test(normalizedOrigin));
 }
+
+app.disable('x-powered-by');
+app.set('trust proxy', process.env.TRUST_PROXY === 'true');
+
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
 
 app.use(cors({
   origin(origin, callback) {
-    if (isAllowedOrigin(origin)) {
+    const normalizedOrigin = String(origin || '').trim();
+    if (isAllowedOrigin(origin, normalizedOrigin)) {
       return callback(null, true);
     }
-    const error = new Error('CORS origin not allowed.');
-    error.statusCode = 403;
+    const error = createHttpError(403, 'CORS_ORIGIN_BLOCKED', 'CORS origin not allowed.', {
+      retryable: false,
+    });
     return callback(error);
   },
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept'],
+  credentials: false,
 }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '2mb' }));
-
-app.get('/', (req, res) => {
-  return ok(res, { message: 'Document-analyzer-rag backend running' });
-});
-
-app.get('/health', (req, res) => {
-  return ok(res, { status: 'ok', service: 'Document-analyzer-rag Backend' });
-});
+app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 
 // Authentication has been intentionally removed in this phase to support a local-first academic deployment.
 // The backend is structured to allow seamless reintroduction of JWT-based authentication in future iterations without architectural changes.
 app.use('/api/v1', rateLimiter({ windowMs: 60_000, maxRequests: 100 }), apiV1Route);
-
-// Transitional aliases for one release.
-app.use(legacyRoute);
 
 app.use((err, req, res, next) => {
   if (res.headersSent) {
@@ -72,18 +87,18 @@ app.use((err, req, res, next) => {
     return fail(
       res,
       err.code === 'LIMIT_FILE_SIZE'
-        ? 'Uploaded file exceeds configured size limit.'
-        : 'Upload failed.',
+        ? createHttpError(400, 'UPLOAD_TOO_LARGE', 'Uploaded file exceeds configured size limit.')
+        : createHttpError(400, 'UPLOAD_FAILED', 'Upload failed.'),
       400
     );
   }
 
   if (err?.type === 'entity.parse.failed') {
-    return fail(res, 'Invalid JSON body.', 400);
+    return fail(res, createHttpError(400, 'INVALID_JSON', 'Invalid JSON body.'), 400);
   }
 
   if (err?.type === 'entity.too.large') {
-    return fail(res, 'Request payload too large.', 413);
+    return fail(res, createHttpError(413, 'PAYLOAD_TOO_LARGE', 'Request payload too large.'), 413);
   }
 
   const isSqliteError = String(err?.code || '').startsWith('SQLITE');
@@ -102,11 +117,11 @@ app.use((err, req, res, next) => {
       status: normalized.status,
     });
   }
-  return fail(res, normalized.message, normalized.status);
+  return fail(res, normalized.error, normalized.status);
 });
 
 app.use((req, res) => {
-  return fail(res, 'Not found.', 404);
+  return fail(res, createHttpError(404, 'NOT_FOUND', 'Not found.'), 404);
 });
 
 module.exports = app;

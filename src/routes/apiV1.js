@@ -1,6 +1,8 @@
 const express = require('express');
 const fs = require('fs/promises');
+const os = require('os');
 const multer = require('multer');
+const { z } = require('zod');
 const {
   listSessions,
   createSession,
@@ -25,6 +27,8 @@ const { addJob, getJob, getQueueState } = require('../services/jobQueue');
 const { runChatQuery, shouldRunAsyncChat } = require('../services/ragService');
 const { addConversation, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
 const { getMetrics, recordQuery } = require('../services/metricsService');
+const rateLimiter = require('../middleware/rateLimiter');
+const validateSchema = require('../middleware/validate');
 const { ok, fail } = require('./helpers');
 const asyncHandler = require('../utils/asyncHandler');
 const { createHttpError } = require('../utils/errors');
@@ -39,15 +43,43 @@ const upload = multer({
   },
 });
 
+const createSessionBodySchema = z.object({
+  title: z.string().min(1).max(160),
+});
+
+const chatBodySchema = z.object({
+  message: z.string().min(1).max(10_000),
+  history: z.array(z.object({
+    role: z.enum(['user', 'assistant']),
+    text: z.string(),
+  })).max(100).optional(),
+});
+
+const historyQuerySchema = z.object({
+  limit: z
+    .string()
+    .regex(/^\d+$/)
+    .optional(),
+  offset: z
+    .string()
+    .regex(/^\d+$/)
+    .optional(),
+});
+
+const strictReadLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 200 });
+const writeLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 80 });
+const uploadLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 16 });
+const chatLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 30 });
+
 function normalizeMulterError(error) {
   if (error?.name === 'MulterError') {
-    const err = new Error(
+    throw createHttpError(
+      400,
+      error.code === 'LIMIT_FILE_SIZE' ? 'UPLOAD_TOO_LARGE' : 'UPLOAD_FAILED',
       error.code === 'LIMIT_FILE_SIZE'
         ? 'Uploaded file exceeds configured size limit.'
         : error.message || 'Upload failed.'
     );
-    err.statusCode = 400;
-    throw err;
   }
   if (error) {
     throw error;
@@ -57,7 +89,9 @@ function normalizeMulterError(error) {
 function parsePositiveInt(value, fieldName) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw createHttpError(400, `${fieldName} must be a positive integer.`);
+    throw createHttpError(400, 'INVALID_PATH_PARAM', `${fieldName} must be a positive integer.`, {
+      retryable: false,
+    });
   }
   return parsed;
 }
@@ -81,35 +115,54 @@ function normalizeOptionalTitle(title, fallback) {
   return sanitizeFilename(fallback || 'uploaded.pdf').replace(/\.pdf$/i, '');
 }
 
-router.get('/health', (req, res) => ok(res, { status: 'ok', service: 'Document-analyzer-rag Backend' }));
-router.get('/ping', (req, res) => ok(res, { pong: true }));
+router.get('/health', strictReadLimiter, (req, res) => {
+  const queueState = getQueueState();
+  const memoryUsage = process.memoryUsage();
+  const cpuLoad = os.loadavg();
 
-router.get('/sessions', (req, res) => ok(res, listSessions()));
+  return ok(res, {
+    status: 'ok',
+    service: 'Document-analyzer-rag Backend',
+    uptime: process.uptime(),
+    queueSize: queueState.pending + queueState.processing,
+    memoryUsage: {
+      rss: memoryUsage.rss,
+      heapTotal: memoryUsage.heapTotal,
+      heapUsed: memoryUsage.heapUsed,
+      external: memoryUsage.external,
+    },
+    cpuLoad: {
+      oneMinute: cpuLoad[0],
+      fiveMinutes: cpuLoad[1],
+      fifteenMinutes: cpuLoad[2],
+    },
+  });
+});
+router.get('/ping', strictReadLimiter, (req, res) => ok(res, { pong: true }));
 
-router.post('/sessions', (req, res) => {
-  const title = String(req.body?.title || '').trim();
-  if (!title) {
-    throw createHttpError(400, 'title is required and must be a string.');
-  }
+router.get('/sessions', strictReadLimiter, (req, res) => ok(res, listSessions()));
+
+router.post('/sessions', writeLimiter, validateSchema(createSessionBodySchema), (req, res) => {
+  const title = req.body.title.trim();
 
   const session = createSession(title);
   return ok(res, session);
 });
 
-router.get('/sessions/:sessionId', (req, res) => {
+router.get('/sessions/:sessionId', strictReadLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   const session = assertSessionExists(sessionId);
   const pdfs = listPdfsBySession(sessionId);
   return ok(res, { ...session, pdfs });
 });
 
-router.delete('/sessions/:sessionId', (req, res) => {
+router.delete('/sessions/:sessionId', writeLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   const result = deleteSession(sessionId);
   return ok(res, result);
 });
 
-router.post('/sessions/:sessionId/pdfs', (req, res, next) => {
+router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
   upload.single('file')(req, res, async (uploadErr) => {
     try {
       normalizeMulterError(uploadErr);
@@ -117,7 +170,7 @@ router.post('/sessions/:sessionId/pdfs', (req, res, next) => {
       assertSessionExists(sessionId);
 
       if (!req.file) {
-        throw createHttpError(400, 'file is required as multipart form-data.');
+        throw createHttpError(400, 'MISSING_UPLOAD_FILE', 'file is required as multipart form-data.');
       }
 
       logInfo('UPLOAD_START', {
@@ -170,13 +223,13 @@ router.post('/sessions/:sessionId/pdfs', (req, res, next) => {
   });
 });
 
-router.get('/pdfs/:pdfId', (req, res) => {
+router.get('/pdfs/:pdfId', strictReadLimiter, (req, res) => {
   const pdfId = parsePositiveInt(req.params.pdfId, 'pdfId');
   const pdf = assertPdfExists(pdfId);
   return ok(res, pdf);
 });
 
-router.delete('/pdfs/:pdfId', asyncHandler(async (req, res) => {
+router.delete('/pdfs/:pdfId', writeLimiter, asyncHandler(async (req, res) => {
   const pdfId = parsePositiveInt(req.params.pdfId, 'pdfId');
   const removeFile = String(req.query.removeFile || 'false').toLowerCase() === 'true';
 
@@ -196,26 +249,28 @@ router.delete('/pdfs/:pdfId', asyncHandler(async (req, res) => {
   return ok(res, result);
 }));
 
-router.get('/sessions/:sessionId/pdfs', (req, res) => {
+router.get('/sessions/:sessionId/pdfs', strictReadLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   assertSessionExists(sessionId);
   return ok(res, listPdfsBySession(sessionId));
 });
 
-router.post('/sessions/:sessionId/chat', asyncHandler(async (req, res) => {
+router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySchema), asyncHandler(async (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   const session = assertSessionExists(sessionId);
-  const message = String(req.body?.message || '').trim();
+  const message = req.body.message.trim();
   const { history } = req.body;
-
-  if (!message) {
-    throw createHttpError(400, 'message is required and must be a string.');
-  }
 
   const normalizedHistory = validateHistory(history);
   const readiness = getPdfReadinessBySession(sessionId);
   if (readiness.uploaded === 0 || readiness.indexed === 0 || readiness.processing > 0 || readiness.failed > 0) {
-    return fail(res, 'PDF_NOT_READY', 400);
+    return fail(
+      res,
+      createHttpError(400, 'PDF_NOT_READY', 'Documents still processing or failed indexing.', {
+        retryable: readiness.processing > 0,
+      }),
+      400
+    );
   }
 
   logInfo('CHAT_REQUEST', {
@@ -269,10 +324,10 @@ router.post('/sessions/:sessionId/chat', asyncHandler(async (req, res) => {
   });
 }));
 
-router.get('/jobs/:jobId', (req, res) => {
+router.get('/jobs/:jobId', strictReadLimiter, (req, res) => {
   const job = getJob(req.params.jobId);
   if (!job) {
-    throw createHttpError(400, 'jobId does not exist.');
+    throw createHttpError(400, 'UNKNOWN_JOB_ID', 'jobId does not exist.');
   }
 
   return ok(res, {
@@ -286,7 +341,7 @@ router.get('/jobs/:jobId', (req, res) => {
   });
 });
 
-router.get('/sessions/:sessionId/history', (req, res) => {
+router.get('/sessions/:sessionId/history', strictReadLimiter, validateSchema(historyQuerySchema, 'query'), (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   assertSessionExists(sessionId);
   const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
@@ -294,15 +349,15 @@ router.get('/sessions/:sessionId/history', (req, res) => {
   return ok(res, listSessionHistory(sessionId, { limit, offset }));
 });
 
-router.delete('/sessions/:sessionId/history', (req, res) => {
+router.delete('/sessions/:sessionId/history', writeLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
   assertSessionExists(sessionId);
   return ok(res, clearSessionHistory(sessionId));
 });
 
-router.get('/admin/queue', (req, res) => {
+router.get('/admin/queue', strictReadLimiter, (req, res) => {
   if (process.env.NODE_ENV === 'production') {
-    throw createHttpError(400, 'Admin queue endpoint is disabled in production.');
+    throw createHttpError(400, 'ADMIN_DISABLED', 'Admin queue endpoint is disabled in production.');
   }
 
   return ok(res, {
@@ -311,9 +366,9 @@ router.get('/admin/queue', (req, res) => {
   });
 });
 
-router.post('/admin/reset', asyncHandler(async (req, res) => {
+router.post('/admin/reset', writeLimiter, asyncHandler(async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
-    throw createHttpError(400, 'Admin reset endpoint is disabled in production.');
+    throw createHttpError(400, 'ADMIN_DISABLED', 'Admin reset endpoint is disabled in production.');
   }
 
   await fs.rm(uploadsRoot, { recursive: true, force: true }).catch((error) => {

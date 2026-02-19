@@ -11,13 +11,15 @@ let running = false;
 let sequence = 1;
 
 const insertJobStmt = db.prepare(`
-  INSERT INTO job_queue (id, type, payload, status, attempts, maxRetries, result, error, createdAt, updatedAt)
-  VALUES (@id, @type, @payload, @status, @attempts, @maxRetries, @result, @error, @createdAt, @updatedAt)
+  INSERT INTO job_queue (id, type, payload, status, progress, stage, attempts, maxRetries, result, error, createdAt, updatedAt)
+  VALUES (@id, @type, @payload, @status, @progress, @stage, @attempts, @maxRetries, @result, @error, @createdAt, @updatedAt)
 `);
 
 const updateJobStmt = db.prepare(`
   UPDATE job_queue
   SET status = @status,
+      progress = @progress,
+      stage = @stage,
       attempts = @attempts,
       maxRetries = @maxRetries,
       result = @result,
@@ -27,14 +29,14 @@ const updateJobStmt = db.prepare(`
 `);
 
 const selectRecoverableJobsStmt = db.prepare(`
-  SELECT id, type, payload, status, attempts, maxRetries, result, error, createdAt, updatedAt
+  SELECT id, type, payload, status, progress, stage, attempts, maxRetries, result, error, createdAt, updatedAt
   FROM job_queue
   WHERE status IN ('queued', 'processing')
   ORDER BY createdAt ASC
 `);
 
 const selectJobByIdStmt = db.prepare(`
-  SELECT id, type, payload, status, attempts, maxRetries, result, error, createdAt, updatedAt
+  SELECT id, type, payload, status, progress, stage, attempts, maxRetries, result, error, createdAt, updatedAt
   FROM job_queue
   WHERE id = ?
 `);
@@ -45,6 +47,8 @@ function persistJob(job, isNew = false) {
     type: job.type,
     payload: JSON.stringify(job.payload),
     status: job.status,
+    progress: Math.max(0, Math.min(100, Number(job.progress) || 0)),
+    stage: job.stage || null,
     attempts: job.attempts,
     maxRetries: job.maxRetries,
     result: job.result ? JSON.stringify(job.result) : null,
@@ -94,6 +98,8 @@ function hydrateJobFromRow(row) {
     type: row.type,
     payload: parsedPayload,
     status: row.status === 'processing' ? 'queued' : row.status,
+    progress: Math.max(0, Math.min(100, Number(row.progress) || 0)),
+    stage: row.stage || null,
     attempts: Number(row.attempts) || 0,
     maxRetries: Number(row.maxRetries) || 3,
     createdAt: row.createdAt,
@@ -102,6 +108,31 @@ function hydrateJobFromRow(row) {
     error: row.error || null,
     metrics: null,
   };
+}
+
+function getDefaultStageByType(type) {
+  if (type === 'indexPdf') {
+    return 'uploading';
+  }
+  if (type === 'chatQuery') {
+    return 'retrieving';
+  }
+  return null;
+}
+
+function updateJobProgress(job, { progress, stage }) {
+  const normalizedProgress = Math.max(0, Math.min(100, Number(progress) || 0));
+  const normalizedStage = stage || job.stage || getDefaultStageByType(job.type);
+  const didChange = job.progress !== normalizedProgress || job.stage !== normalizedStage;
+
+  job.progress = normalizedProgress;
+  job.stage = normalizedStage;
+  if (!didChange) {
+    return true;
+  }
+
+  job.updatedAt = new Date().toISOString();
+  return safePersistJob(job, false, 'setProgress');
 }
 
 function wait(ms) {
@@ -147,6 +178,24 @@ function getQueueState() {
   };
 }
 
+function getQueuePosition(jobId) {
+  const job = getJob(jobId);
+  if (!job) {
+    return null;
+  }
+  if (job.status !== 'queued') {
+    return 0;
+  }
+
+  const queuedIndex = queue.indexOf(jobId);
+  if (queuedIndex < 0) {
+    return 0;
+  }
+
+  const hasProcessingJob = Array.from(jobs.values()).some((candidate) => candidate.status === 'processing');
+  return queuedIndex + (hasProcessingJob ? 1 : 0);
+}
+
 function addJob(payload) {
   const jobId = createJobId();
   const normalizedMaxRetries = Number.isInteger(payload.maxRetries) && payload.maxRetries >= 0
@@ -157,6 +206,8 @@ function addJob(payload) {
     type: payload.type,
     payload,
     status: 'queued',
+    progress: 0,
+    stage: getDefaultStageByType(payload.type),
     attempts: 0,
     maxRetries: normalizedMaxRetries,
     createdAt: new Date().toISOString(),
@@ -188,11 +239,16 @@ async function runJob(job) {
   const startedAt = Date.now();
 
   if (job.type === 'indexPdf') {
-    const result = await indexPdfById(job.payload.pdfId);
+    const result = await indexPdfById(job.payload.pdfId, {
+      onProgress: ({ progress, stage }) => {
+        updateJobProgress(job, { progress, stage });
+      },
+    });
     recordIndexing({
       indexingTimeMs: result.indexingTimeMs || 0,
       embeddingTimeMs: result.embeddingTimeMs || 0,
     });
+    updateJobProgress(job, { progress: 100, stage: 'embedding' });
     return {
       ...result,
       indexingTimeMs: result.indexingTimeMs || Date.now() - startedAt,
@@ -200,7 +256,11 @@ async function runJob(job) {
   }
 
   if (job.type === 'chatQuery') {
-    const response = await runChatQuery(job.payload);
+    const response = await runChatQuery(job.payload, {
+      onProgress: ({ progress, stage }) => {
+        updateJobProgress(job, { progress, stage });
+      },
+    });
     recordQuery({ queryTimeMs: Date.now() - startedAt });
     try {
       addConversation({
@@ -215,6 +275,7 @@ async function runJob(job) {
         sessionId: job.payload.sessionId,
       });
     }
+    updateJobProgress(job, { progress: 100, stage: 'generating' });
     return response;
   }
 
@@ -238,8 +299,16 @@ async function processQueue() {
       job.status = 'processing';
       job.updatedAt = new Date().toISOString();
       job.attempts += 1;
+      if (job.type === 'indexPdf') {
+        job.progress = Math.max(job.progress || 0, 5);
+        job.stage = 'parsing';
+      } else if (job.type === 'chatQuery') {
+        job.progress = Math.max(job.progress || 0, 10);
+        job.stage = 'retrieving';
+      }
       if (!safePersistJob(job, false, 'setProcessing')) {
         job.status = 'failed';
+        job.progress = Math.max(job.progress || 0, 0);
         job.error = 'Failed to persist processing status.';
         job.updatedAt = new Date().toISOString();
         safePersistJob(job, false, 'markFailedAfterSetProcessing');
@@ -251,6 +320,7 @@ async function processQueue() {
       try {
         const result = await runJob(job);
         job.status = 'completed';
+        job.progress = 100;
         job.result = result;
         job.metrics = {
           durationMs: Date.now() - startedAt,
@@ -263,18 +333,22 @@ async function processQueue() {
 
         if (job.attempts <= job.maxRetries) {
           job.status = 'queued';
+          job.stage = getDefaultStageByType(job.type);
+          job.progress = 0;
           const backoffMs = 250 * Math.pow(2, job.attempts - 1);
           if (safePersistJob(job, false, 'setRetry')) {
             await wait(backoffMs);
             queue.push(job.id);
           } else {
             job.status = 'failed';
+            job.progress = Math.max(job.progress || 0, 0);
             job.error = 'Failed to persist retry state.';
             job.updatedAt = new Date().toISOString();
             safePersistJob(job, false, 'markFailedAfterRetryPersistError');
           }
         } else {
           job.status = 'failed';
+          job.progress = Math.max(job.progress || 0, 0);
           safePersistJob(job, false, 'setFailed');
           logError('ERROR_QUEUE', error, {
             service: 'jobQueue',
@@ -321,6 +395,12 @@ function recoverJobsFromDatabase() {
 
   for (const row of recoverable) {
     const job = hydrateJobFromRow(row);
+    if (!job.stage) {
+      job.stage = getDefaultStageByType(job.type);
+    }
+    if (!Number.isFinite(job.progress)) {
+      job.progress = 0;
+    }
     jobs.set(job.id, job);
     queue.push(job.id);
     safePersistJob(job, false, 'recoverUpdateQueued');
@@ -342,4 +422,5 @@ module.exports = {
   addJob,
   getJob,
   getQueueState,
+  getQueuePosition,
 };

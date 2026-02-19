@@ -1,4 +1,5 @@
 const fs = require('fs/promises');
+const crypto = require('crypto');
 const { extractTextFromPdfBuffer } = require('./pdfService');
 const { chunkText } = require('./chunkService');
 const { generateEmbeddings } = require('./embeddingService');
@@ -45,16 +46,36 @@ function getIndexingParams(text) {
   return { chunkSize, overlap, batchSize };
 }
 
-async function indexPdfById(pdfId) {
+function toChunkKey(index, text) {
+  return crypto
+    .createHash('sha1')
+    .update(`${index}:${text}`)
+    .digest('hex');
+}
+
+function reportProgress(onProgress, stage, progress) {
+  if (typeof onProgress !== 'function') {
+    return;
+  }
+  onProgress({
+    stage,
+    progress: Math.max(0, Math.min(100, Number(progress) || 0)),
+  });
+}
+
+async function indexPdfById(pdfId, options = {}) {
   const startedAt = Date.now();
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const pdf = getPdfById(pdfId);
   if (!pdf) {
     return { indexedChunks: 0, skipped: true };
   }
 
   try {
+    reportProgress(onProgress, 'parsing', 10);
     const fileBuffer = await fs.readFile(pdf.path);
     const rawText = await extractTextFromPdfBuffer(fileBuffer);
+    reportProgress(onProgress, 'chunking', 35);
     const indexingParams = getIndexingParams(rawText);
     const chunks = chunkText(rawText, {
       chunkSize: indexingParams.chunkSize,
@@ -67,22 +88,30 @@ async function indexPdfById(pdfId) {
     }
 
     const embeddingStartedAt = Date.now();
+    reportProgress(onProgress, 'embedding', 45);
     const vectors = await generateEmbeddings(chunks, {
       batchSize: indexingParams.batchSize,
+      onProgress: ({ processed, total }) => {
+        const ratio = total > 0 ? processed / total : 0;
+        reportProgress(onProgress, 'embedding', 45 + Math.round(ratio * 45));
+      },
     });
 
     const items = chunks.map((text, index) => ({
       text,
       embedding: vectors[index],
+      chunkKey: toChunkKey(index, text),
     }));
 
     const inserted = addChunks({
       sessionId: pdf.sessionId,
       pdfId: pdf.id,
       items,
+      replacePdfChunks: true,
     });
 
     markPdfIndexed(pdfId, inserted);
+    reportProgress(onProgress, 'embedding', 100);
     logInfo('INDEX_DONE', {
       pdfId,
       sessionId: pdf.sessionId,

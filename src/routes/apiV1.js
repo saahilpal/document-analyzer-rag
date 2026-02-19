@@ -25,7 +25,12 @@ const {
   removeStoredPdf,
   removeTempUpload,
 } = require('../services/uploadService');
-const { addJob, getJob, getQueueState } = require('../services/jobQueue');
+const {
+  addJob,
+  getJob,
+  getQueueState,
+  getQueuePosition,
+} = require('../services/jobQueue');
 const { runChatQuery, shouldRunAsyncChat } = require('../services/ragService');
 const { addConversation, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
 const { getMetrics, recordQuery } = require('../services/metricsService');
@@ -220,7 +225,7 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
         throw error;
       }
 
-      addJob({
+      const indexJob = addJob({
         type: 'indexPdf',
         pdfId: pdf.id,
         maxRetries: 3,
@@ -231,6 +236,10 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
         sessionId,
         title: pdf.title,
         status: 'processing',
+        jobId: indexJob.id,
+        progress: indexJob.progress,
+        stage: indexJob.stage,
+        queuePosition: getQueuePosition(indexJob.id),
       }, 202);
     } catch (error) {
       await removeTempUpload(tempFilePath).catch((cleanupError) => {
@@ -313,6 +322,9 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
       jobId: job.id,
       sessionId,
       status: 'processing',
+      progress: job.progress,
+      stage: job.stage,
+      queuePosition: getQueuePosition(job.id),
     }, 202);
   }
 
@@ -355,6 +367,9 @@ router.get('/jobs/:jobId', strictReadLimiter, (req, res) => {
     id: job.id,
     type: job.type,
     status: job.status,
+    progress: job.progress,
+    stage: job.stage,
+    queuePosition: getQueuePosition(job.id),
     attempts: job.attempts,
     result: job.result,
     error: job.error,

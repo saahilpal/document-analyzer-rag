@@ -6,15 +6,15 @@ const MAX_CHUNK_CACHE_ENTRIES_PER_PDF = 200;
 const embeddingCacheByPdf = new Map();
 
 const insertChunkStmt = db.prepare(`
-  INSERT INTO chunks (id, sessionId, pdfId, text, embedding, embeddingVectorLength, createdAt)
-  VALUES (@id, @sessionId, @pdfId, @text, @embedding, @embeddingVectorLength, @createdAt)
+  INSERT OR REPLACE INTO chunks (id, sessionId, pdfId, chunkKey, text, embedding, embeddingVectorLength, createdAt)
+  VALUES (@id, @sessionId, @pdfId, @chunkKey, @text, @embedding, @embeddingVectorLength, @createdAt)
 `);
 
-const selectChunksBySessionStmt = db.prepare(`
+const selectChunkPageBySessionStmt = db.prepare(`
   SELECT id, pdfId, text, embedding, embeddingVectorLength
   FROM chunks
-  WHERE sessionId = ?
-  ORDER BY createdAt DESC
+  WHERE sessionId = ? AND embeddingVectorLength = ?
+  ORDER BY id ASC
   LIMIT ? OFFSET ?
 `);
 
@@ -22,6 +22,11 @@ const countChunksBySessionStmt = db.prepare(`
   SELECT COUNT(*) AS count
   FROM chunks
   WHERE sessionId = ?
+`);
+
+const deleteChunksByPdfStmt = db.prepare(`
+  DELETE FROM chunks
+  WHERE pdfId = ?
 `);
 
 const selectRecentTextsBySessionStmt = db.prepare(`
@@ -76,21 +81,29 @@ function getCachedVector(pdfId, chunkId) {
   return value;
 }
 
-function addChunks({ sessionId, pdfId, items }) {
+function addChunks({ sessionId, pdfId, items, replacePdfChunks = false }) {
   const now = new Date().toISOString();
 
   const insertMany = db.transaction((rows) => {
+    if (replacePdfChunks && pdfId) {
+      invalidatePdfCache(pdfId);
+      deleteChunksByPdfStmt.run(pdfId);
+    }
+
+    let index = 0;
     for (const row of rows) {
       const embedding = Array.isArray(row.embedding) ? row.embedding : [];
       insertChunkStmt.run({
         id: uuidv4(),
         sessionId,
         pdfId,
+        chunkKey: String(row.chunkKey || `${pdfId || 'pdf'}:${index}`),
         text: row.text,
         embedding: JSON.stringify(embedding),
         embeddingVectorLength: embedding.length,
         createdAt: now,
       });
+      index += 1;
     }
   });
 
@@ -138,33 +151,80 @@ function parseVectorForChunk(chunk) {
   }
 }
 
-async function similaritySearch({ sessionId, queryEmbedding, topK = 5, limit = 300, offset = 0 }) {
-  const rows = selectChunksBySessionStmt.all(sessionId, limit, offset);
+function mergeTopK(existing, next, topK) {
+  return [...existing, ...next]
+    .filter((item) => item && Number.isFinite(item.score) && item.score >= 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+}
+
+async function similaritySearch({
+  sessionId,
+  queryEmbedding,
+  topK = 5,
+  pageSize = Number(process.env.RAG_CANDIDATE_PAGE_SIZE) || 400,
+  onProgress,
+}) {
   const normalizedTopK = Math.max(1, Math.min(5, Number(topK) || 5));
+  const normalizedPageSize = Math.max(50, Math.min(1000, Number(pageSize) || 400));
+  const totalRows = countChunksBySessionStmt.get(sessionId).count;
+  const queryVectorLength = Array.isArray(queryEmbedding) ? queryEmbedding.length : 0;
 
-  return new Promise((resolve) => {
-    setImmediate(() => {
-      const result = rows
-        .map((row) => {
-          const vector = parseVectorForChunk(row);
-          if (!vector) {
-            return null;
-          }
+  if (!queryVectorLength || totalRows === 0) {
+    if (typeof onProgress === 'function') {
+      onProgress({ processed: 0, total: totalRows });
+    }
+    return [];
+  }
 
-          return {
-            chunkId: row.id,
-            pdfId: row.pdfId,
-            text: row.text,
-            score: cosineSimilarity(queryEmbedding, vector),
-          };
-        })
-        .filter((item) => item && Number.isFinite(item.score) && item.score >= 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, normalizedTopK);
+  let offset = 0;
+  let bestMatches = [];
 
-      resolve(result);
+  while (offset < totalRows) {
+    const rows = selectChunkPageBySessionStmt.all(
+      sessionId,
+      queryVectorLength,
+      normalizedPageSize,
+      offset
+    );
+    if (rows.length === 0) {
+      break;
+    }
+
+    const scoredRows = rows
+      .map((row) => {
+        const vector = parseVectorForChunk(row);
+        if (!vector) {
+          return null;
+        }
+
+        return {
+          chunkId: row.id,
+          pdfId: row.pdfId,
+          text: row.text,
+          score: cosineSimilarity(queryEmbedding, vector),
+        };
+      })
+      .filter((item) => item && Number.isFinite(item.score) && item.score >= 0);
+
+    bestMatches = mergeTopK(bestMatches, scoredRows, normalizedTopK);
+    offset += rows.length;
+
+    if (typeof onProgress === 'function') {
+      onProgress({
+        processed: Math.min(offset, totalRows),
+        total: totalRows,
+      });
+    }
+
+    // Yield between pages to keep the event loop responsive on large corpora.
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => {
+      setImmediate(resolve);
     });
-  });
+  }
+
+  return bestMatches.sort((a, b) => b.score - a.score).slice(0, normalizedTopK);
 }
 
 function getChunkCountBySession(sessionId) {

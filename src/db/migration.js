@@ -29,13 +29,6 @@ function tableExists(db, tableName) {
   return !!row;
 }
 
-function getCount(db, tableName) {
-  if (!tableExists(db, tableName)) {
-    return 0;
-  }
-  return db.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get().count;
-}
-
 function logAction(actions, sql, description) {
   actions.push({ sql, description });
 }
@@ -81,6 +74,7 @@ function ensureNewTables(db, actions) {
         id TEXT PRIMARY KEY,
         sessionId INTEGER NOT NULL,
         pdfId INTEGER,
+        chunkKey TEXT,
         text TEXT NOT NULL,
         embedding TEXT NOT NULL,
         embeddingVectorLength INTEGER NOT NULL DEFAULT 0,
@@ -107,6 +101,8 @@ function ensureNewTables(db, actions) {
         type TEXT NOT NULL,
         payload TEXT NOT NULL,
         status TEXT NOT NULL,
+        progress INTEGER NOT NULL DEFAULT 0,
+        stage TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         maxRetries INTEGER NOT NULL DEFAULT 3,
         result TEXT,
@@ -147,6 +143,10 @@ function ensureNewTables(db, actions) {
       description: 'Create job_queue status index',
       sql: 'CREATE INDEX IF NOT EXISTS idx_job_queue_status ON job_queue(status);',
     },
+    {
+      description: 'Create job_queue updatedAt index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_job_queue_updatedAt ON job_queue(updatedAt);',
+    },
   ];
 
   for (const statement of statements) {
@@ -171,6 +171,55 @@ function ensureSessionMetadataColumns(db, actions) {
   const indexSql = 'CREATE INDEX IF NOT EXISTS idx_sessions_last_message_at ON sessions(last_message_at);';
   logAction(actions, indexSql, 'Create sessions last_message_at index');
   db.exec(indexSql);
+}
+
+function ensureChunkIdempotencyColumns(db, actions) {
+  if (!columnExists(db, 'chunks', 'chunkKey')) {
+    const sql = 'ALTER TABLE chunks ADD COLUMN chunkKey TEXT;';
+    logAction(actions, sql, 'Add chunks.chunkKey column');
+    db.exec(sql);
+  }
+
+  if (tableExists(db, 'chunks')) {
+    const backfillSql = `
+      UPDATE chunks
+      SET chunkKey = COALESCE(NULLIF(chunkKey, ''), id)
+      WHERE chunkKey IS NULL OR chunkKey = '';
+    `;
+    logAction(actions, backfillSql.trim(), 'Backfill chunks.chunkKey values');
+    db.exec(backfillSql);
+  }
+
+  const indexSql = 'CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_pdf_chunkKey_unique ON chunks(pdfId, chunkKey);';
+  logAction(actions, indexSql, 'Create chunks pdfId+chunkKey unique index');
+  db.exec(indexSql);
+}
+
+function ensureJobProgressColumns(db, actions) {
+  if (!columnExists(db, 'job_queue', 'progress')) {
+    const sql = 'ALTER TABLE job_queue ADD COLUMN progress INTEGER NOT NULL DEFAULT 0;';
+    logAction(actions, sql, 'Add job_queue.progress column');
+    db.exec(sql);
+  }
+
+  if (!columnExists(db, 'job_queue', 'stage')) {
+    const sql = 'ALTER TABLE job_queue ADD COLUMN stage TEXT;';
+    logAction(actions, sql, 'Add job_queue.stage column');
+    db.exec(sql);
+  }
+
+  if (tableExists(db, 'job_queue')) {
+    const normalizeSql = `
+      UPDATE job_queue
+      SET progress = CASE
+        WHEN status = 'completed' THEN 100
+        ELSE COALESCE(progress, 0)
+      END
+      WHERE progress IS NULL OR progress < 0 OR progress > 100;
+    `;
+    logAction(actions, normalizeSql.trim(), 'Normalize job_queue.progress values');
+    db.exec(normalizeSql);
+  }
 }
 
 function normalizeChatMessageTimestamps(db, actions) {
@@ -222,111 +271,15 @@ function backfillSessionMessageMetadata(db, actions) {
   db.exec(sql);
 }
 
-function migrateLegacyData(db, actions) {
-  const hasSubjects = tableExists(db, 'subjects');
-  const hasDocuments = tableExists(db, 'documents');
-  const hasEmbeddings = tableExists(db, 'embeddings');
-  const hasChatHistory = tableExists(db, 'chat_history');
-
-  if (!hasSubjects && !hasDocuments && !hasEmbeddings) {
-    return;
-  }
-
-  const sessionsCount = getCount(db, 'sessions');
-  const pdfsCount = getCount(db, 'pdfs');
-  const chunksCount = getCount(db, 'chunks');
-
-  if (hasSubjects && sessionsCount === 0) {
-    const sql = `
-      INSERT INTO sessions (id, title, createdAt)
-      SELECT id, name, datetime('now')
-      FROM subjects;
-    `;
-    logAction(actions, sql.trim(), 'Migrate subjects -> sessions');
-    db.exec(sql);
-  }
-
-  if (hasDocuments && pdfsCount === 0) {
-    const sql = `
-      INSERT INTO pdfs (id, sessionId, title, filename, path, type, status, indexedChunks, createdAt)
-      SELECT
-        d.id,
-        d.subjectId,
-        d.title,
-        d.path,
-        d.path,
-        lower(d.type),
-        'indexed',
-        0,
-        COALESCE(d.createdAt, datetime('now'))
-      FROM documents d;
-    `;
-    logAction(actions, sql.trim(), 'Migrate documents -> pdfs');
-    db.exec(sql);
-
-    const updateSql = `
-      UPDATE pdfs
-      SET indexedChunks = (
-        SELECT COUNT(*)
-        FROM embeddings e
-        WHERE e.documentId = pdfs.id
-      )
-      WHERE id IN (SELECT id FROM pdfs);
-    `;
-    logAction(actions, updateSql.trim(), 'Backfill indexedChunks on migrated pdfs');
-    if (hasEmbeddings) {
-      db.exec(updateSql);
-    }
-  }
-
-  if (hasEmbeddings && chunksCount === 0) {
-    const columns = db.prepare('PRAGMA table_info(embeddings)').all().map((column) => column.name);
-    const hasSubjectId = columns.includes('subjectId');
-    const hasDocumentId = columns.includes('documentId');
-
-    const sql = `
-      INSERT INTO chunks (id, sessionId, pdfId, text, embedding, embeddingVectorLength, createdAt)
-      SELECT
-        id,
-        ${hasSubjectId ? 'subjectId' : '1'},
-        ${hasDocumentId ? 'documentId' : 'NULL'},
-        text,
-        embedding,
-        COALESCE(json_array_length(embedding), 0),
-        COALESCE(createdAt, datetime('now'))
-      FROM embeddings;
-    `;
-    logAction(actions, sql.trim(), 'Migrate embeddings -> chunks');
-    db.exec(sql);
-  }
-
-  const chatMessagesCount = getCount(db, 'chat_messages');
-  if (hasChatHistory && chatMessagesCount === 0) {
-    const sql = `
-      INSERT INTO chat_messages (id, sessionId, role, text, createdAt)
-      SELECT id, sessionId, role, text, COALESCE(createdAt, datetime('now'))
-      FROM chat_history;
-    `;
-    logAction(actions, sql.trim(), 'Migrate chat_history -> chat_messages');
-    db.exec(sql);
-  }
-
-  const ensureDefaultSessionSql = `
-    INSERT OR IGNORE INTO sessions (id, title, createdAt)
-    VALUES (1, 'General', datetime('now'));
-  `;
-  logAction(actions, ensureDefaultSessionSql.trim(), 'Ensure default session exists');
-  db.exec(ensureDefaultSessionSql);
-}
-
 function runMigrations({ dryRun = false } = {}) {
   const db = openDatabase();
   const actions = [];
 
   const execute = () => {
     ensureNewTables(db, actions);
-    migrateLegacyData(db, actions);
     ensureSessionMetadataColumns(db, actions);
+    ensureChunkIdempotencyColumns(db, actions);
+    ensureJobProgressColumns(db, actions);
     normalizeChatMessageTimestamps(db, actions);
     backfillSessionMessageMetadata(db, actions);
   };

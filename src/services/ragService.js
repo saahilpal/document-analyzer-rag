@@ -9,7 +9,7 @@ const { similaritySearch, getChunkCountBySession } = require('./vectorService');
 const { logError } = require('../utils/logger');
 
 const DEFAULT_TOP_K = Number(process.env.RAG_TOP_K) || 5;
-const DEFAULT_CANDIDATE_LIMIT = Number(process.env.RAG_CANDIDATE_LIMIT) || 300;
+const DEFAULT_CANDIDATE_PAGE_SIZE = Number(process.env.RAG_CANDIDATE_PAGE_SIZE) || 400;
 const DEFAULT_HISTORY_LIMIT = Number(process.env.RAG_HISTORY_LIMIT) || 12;
 
 function createGenerationError(message, details) {
@@ -66,18 +66,38 @@ async function generateTextWithFallback({ prompt, generationConfig }) {
   throw createGenerationError('Gemini generation failed for all configured models.', getGeminiErrorDetails(lastError));
 }
 
-async function runChatQuery({ sessionId, message, history = [], topK = DEFAULT_TOP_K }) {
+async function runChatQuery(
+  { sessionId, message, history = [], topK = DEFAULT_TOP_K },
+  options = {}
+) {
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+
+  if (onProgress) {
+    onProgress({ stage: 'retrieving', progress: 10 });
+  }
   const queryEmbedding = await generateEmbedding(message);
   const normalizedTopK = Math.max(1, Math.min(5, Number(topK) || DEFAULT_TOP_K));
   const candidates = await similaritySearch({
     sessionId,
     queryEmbedding,
     topK: normalizedTopK,
-    limit: DEFAULT_CANDIDATE_LIMIT,
-    offset: 0,
+    pageSize: DEFAULT_CANDIDATE_PAGE_SIZE,
+    onProgress: ({ processed, total }) => {
+      if (!onProgress) {
+        return;
+      }
+      const ratio = total > 0 ? processed / total : 1;
+      onProgress({
+        stage: 'retrieving',
+        progress: 10 + Math.round(ratio * 50),
+      });
+    },
   });
 
   if (candidates.length === 0) {
+    if (onProgress) {
+      onProgress({ stage: 'generating', progress: 100 });
+    }
     return {
       answer: "I don't know - please provide more context.",
       sources: [],
@@ -93,7 +113,13 @@ async function runChatQuery({ sessionId, message, history = [], topK = DEFAULT_T
 
   let answer = "I don't know - please provide more context.";
   try {
+    if (onProgress) {
+      onProgress({ stage: 'generating', progress: 70 });
+    }
     answer = (await generateTextWithFallback({ prompt })) || answer;
+    if (onProgress) {
+      onProgress({ stage: 'generating', progress: 100 });
+    }
   } catch (error) {
     logError('ERROR_QUEUE', error, {
       service: 'ragService',

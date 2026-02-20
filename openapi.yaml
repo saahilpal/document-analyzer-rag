@@ -68,6 +68,51 @@ components:
         metrics:
           type: object
           nullable: true
+    ChatResponseSection:
+      type: object
+      properties:
+        title:
+          type: string
+        content:
+          type: string
+    ChatResponseSchema:
+      type: object
+      nullable: true
+      properties:
+        format:
+          type: string
+          enum: [structured_sections, structured_markdown]
+        sections:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatResponseSection'
+    ChatResponseData:
+      type: object
+      properties:
+        answer:
+          type: string
+        formattedAnswer:
+          type: string
+        responseSchema:
+          $ref: '#/components/schemas/ChatResponseSchema'
+        responseStyle:
+          type: string
+          enum: [structured, plain]
+        sources:
+          type: array
+          items:
+            type: object
+            properties:
+              pdfId:
+                type: integer
+              chunkId:
+                type: integer
+              score:
+                type: number
+        usedChunksCount:
+          type: integer
+        sessionTitle:
+          type: string
 paths:
   /api/v1/health:
     get:
@@ -215,13 +260,22 @@ paths:
                         enum: [user, assistant]
                       text:
                         type: string
+                responseStyle:
+                  type: string
+                  enum: [structured, plain]
+                  description: Response formatting style. Defaults to structured.
       responses:
         '200':
           description: Chat answer or SSE stream response
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SuccessEnvelope'
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ChatResponseData'
             text/event-stream:
               schema:
                 type: string

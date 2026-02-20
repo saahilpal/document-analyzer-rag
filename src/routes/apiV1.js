@@ -31,7 +31,12 @@ const {
   getQueueState,
   getQueuePosition,
 } = require('../services/jobQueue');
-const { runChatQuery, runChatQueryStream, shouldRunAsyncChat } = require('../services/ragService');
+const {
+  runChatQuery,
+  runChatQueryStream,
+  shouldRunAsyncChat,
+  normalizeResponseStyle,
+} = require('../services/ragService');
 const { addConversation, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
 const { getMetrics, recordQuery } = require('../services/metricsService');
 const rateLimiter = require('../middleware/rateLimiter');
@@ -71,6 +76,7 @@ const chatBodySchema = z.object({
     role: z.enum(['user', 'assistant']),
     text: z.string(),
   })).max(100).optional(),
+  responseStyle: z.enum(['structured', 'plain']).optional(),
 });
 
 const historyQuerySchema = z.object({
@@ -312,6 +318,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
   const session = assertSessionExists(sessionId);
   const message = req.body.message.trim();
   const { history } = req.body;
+  const responseStyle = normalizeResponseStyle(req.body.responseStyle);
 
   const normalizedHistory = validateHistory(history);
   const readiness = getPdfReadinessBySession(sessionId);
@@ -363,6 +370,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
         sessionId,
         message,
         history: normalizedHistory,
+        responseStyle,
       }, {
         onProgress: ({ stage, progress }) => {
           emitEvent('progress', {
@@ -398,6 +406,9 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
         ok: true,
         data: {
           answer: response.answer,
+          formattedAnswer: response.formattedAnswer,
+          responseSchema: response.responseSchema,
+          responseStyle: response.responseStyle,
           sources: response.sources,
           usedChunksCount: response.usedChunksCount,
           sessionTitle: session.title,
@@ -423,6 +434,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
       sessionId,
       message,
       history: normalizedHistory,
+      responseStyle,
       maxRetries: 1,
     });
 
@@ -430,6 +442,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
       jobId: job.id,
       sessionId,
       status: 'processing',
+      responseStyle,
       progress: job.progress,
       stage: job.stage,
       queuePosition: getQueuePosition(job.id),
@@ -441,6 +454,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
     sessionId,
     message,
     history: normalizedHistory,
+    responseStyle,
   });
   const durationMs = Date.now() - startedAt;
   recordQuery({ queryTimeMs: durationMs });
@@ -459,6 +473,9 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
 
   return ok(res, {
     answer: response.answer,
+    formattedAnswer: response.formattedAnswer,
+    responseSchema: response.responseSchema,
+    responseStyle: response.responseStyle,
     sources: response.sources,
     usedChunksCount: response.usedChunksCount,
     sessionTitle: session.title,

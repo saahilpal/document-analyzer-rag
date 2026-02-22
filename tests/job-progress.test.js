@@ -2,11 +2,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const request = require('supertest');
 const app = require('../src/app');
-const { buildSamplePdfBuffer } = require('./helpers');
+const { createAuthContext, buildSamplePdfBuffer } = require('./helpers');
 
 test('job endpoint exposes progress, stage and queue position', async () => {
+  const auth = await createAuthContext(app);
+
   const session = await request(app)
     .post('/api/v1/sessions')
+    .set(auth.authHeader)
     .send({ title: `Job Progress ${Date.now()}` });
 
   assert.equal(session.status, 200);
@@ -14,6 +17,7 @@ test('job endpoint exposes progress, stage and queue position', async () => {
 
   const upload = await request(app)
     .post(`/api/v1/sessions/${sessionId}/pdfs`)
+    .set(auth.authHeader)
     .attach('file', await buildSamplePdfBuffer(), { filename: 'progress.pdf', contentType: 'application/pdf' });
 
   assert.equal(upload.status, 202);
@@ -26,7 +30,9 @@ test('job endpoint exposes progress, stage and queue position', async () => {
   let terminalState = null;
 
   for (let i = 0; i < 50; i += 1) {
-    const job = await request(app).get(`/api/v1/jobs/${jobId}`);
+    const job = await request(app)
+      .get(`/api/v1/jobs/${jobId}`)
+      .set(auth.authHeader);
     assert.equal(job.status, 200);
     assert.equal(job.body.ok, true);
 

@@ -2,11 +2,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const request = require('supertest');
 const app = require('../src/app');
-const { buildSamplePdfBuffer, waitForPdfStatus } = require('./helpers');
+const { createAuthContext, buildSamplePdfBuffer, waitForPdfStatus } = require('./helpers');
 
 test('chat-first integration flow', async () => {
+  const auth = await createAuthContext(app);
+
   const createSession = await request(app)
     .post('/api/v1/sessions')
+    .set(auth.authHeader)
     .send({ title: `Integration Session ${Date.now()}` });
 
   assert.equal(createSession.status, 200);
@@ -17,6 +20,7 @@ test('chat-first integration flow', async () => {
 
   const upload = await request(app)
     .post(`/api/v1/sessions/${sessionId}/pdfs`)
+    .set(auth.authHeader)
     .attach('file', await buildSamplePdfBuffer(), { filename: 'integration.pdf', contentType: 'application/pdf' })
     .field('title', 'Integration PDF');
 
@@ -26,18 +30,28 @@ test('chat-first integration flow', async () => {
   const pdfId = upload.body.data.pdfId;
   assert.ok(pdfId > 0);
 
-  const indexedPdf = await waitForPdfStatus(app, pdfId, 'indexed');
+  const indexedPdf = await waitForPdfStatus(
+    app,
+    pdfId,
+    'indexed',
+    30_000,
+    auth.authHeader,
+    { forceIndexOnFailure: true }
+  );
   assert.ok(indexedPdf.indexedChunks >= 1);
 
   const chat = await request(app)
     .post(`/api/v1/sessions/${sessionId}/chat`)
+    .set(auth.authHeader)
     .send({ message: 'Summarize the document.' });
 
   if (chat.status === 202) {
     const jobId = chat.body.data.jobId;
     let done = false;
     for (let i = 0; i < 40; i += 1) {
-      const poll = await request(app).get(`/api/v1/jobs/${jobId}`);
+      const poll = await request(app)
+        .get(`/api/v1/jobs/${jobId}`)
+        .set(auth.authHeader);
       assert.equal(poll.status, 200);
       const status = poll.body.data.status;
       if (status === 'completed') {
@@ -58,7 +72,9 @@ test('chat-first integration flow', async () => {
     assert.ok(Array.isArray(chat.body.data.sources));
   }
 
-  const history = await request(app).get(`/api/v1/sessions/${sessionId}/history`);
+  const history = await request(app)
+    .get(`/api/v1/sessions/${sessionId}/history`)
+    .set(auth.authHeader);
   assert.equal(history.status, 200);
   assert.equal(history.body.ok, true);
   assert.ok(Array.isArray(history.body.data));

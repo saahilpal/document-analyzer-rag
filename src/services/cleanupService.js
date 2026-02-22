@@ -1,6 +1,7 @@
 const { cleanupJobs } = require('./jobQueue');
 const { cleanupTempUploadsOlderThan } = require('./uploadService');
 const { cleanupOrphanChunks } = require('./vectorService');
+const { cleanupExpiredAuthSessions } = require('./authService');
 const { logInfo, logError } = require('../utils/logger');
 
 const DEFAULT_CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS) || 15 * 60 * 1000;
@@ -28,6 +29,7 @@ async function runCleanupCycle() {
     });
     const removedTempFiles = await cleanupTempUploadsOlderThan(hoursToMs(DEFAULT_TEMP_FILE_TTL_HOURS));
     const removedOrphanChunks = cleanupOrphanChunks();
+    const removedAuthSessions = cleanupExpiredAuthSessions();
 
     const payload = {
       jobsCompletedDeleted: jobs.completedDeleted,
@@ -35,6 +37,7 @@ async function runCleanupCycle() {
       jobsMemoryDeleted: jobs.memoryDeleted,
       removedTempFiles,
       removedOrphanChunks,
+      removedAuthSessions,
     };
     logInfo('CLEANUP_DONE', payload);
     return payload;

@@ -173,6 +173,27 @@ function getJob(jobId) {
   return hydrated;
 }
 
+function getJobForUser(jobId, userId) {
+  const job = getJob(jobId);
+  if (!job) {
+    return null;
+  }
+
+  const normalizedUserId = Number(userId);
+  const jobUserId = Number(job?.payload?.userId);
+  if (!Number.isInteger(normalizedUserId) || normalizedUserId <= 0) {
+    return null;
+  }
+  if (!Number.isInteger(jobUserId) || jobUserId <= 0) {
+    return null;
+  }
+  if (jobUserId !== normalizedUserId) {
+    return null;
+  }
+
+  return job;
+}
+
 function getQueueState() {
   const pending = queue.length;
   const processing = Array.from(jobs.values()).filter((job) => job.status === 'processing').length;
@@ -274,6 +295,7 @@ async function runJob(job) {
     recordQuery({ queryTimeMs: Date.now() - startedAt });
     try {
       addConversation({
+        userId: job.payload.userId,
         sessionId: job.payload.sessionId,
         userText: job.payload.message,
         assistantText: response.answer,
@@ -465,12 +487,38 @@ function cleanupJobs({ completedOlderThanMs, failedOlderThanMs }) {
   };
 }
 
+function removeJobsFromMemory(jobIds) {
+  if (!Array.isArray(jobIds) || jobIds.length === 0) {
+    return 0;
+  }
+
+  const ids = new Set(
+    jobIds
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  );
+
+  for (const id of ids) {
+    jobs.delete(id);
+  }
+
+  for (let i = queue.length - 1; i >= 0; i -= 1) {
+    if (ids.has(queue[i])) {
+      queue.splice(i, 1);
+    }
+  }
+
+  return ids.size;
+}
+
 recoverJobsFromDatabase();
 
 module.exports = {
   addJob,
   getJob,
+  getJobForUser,
   getQueueState,
   getQueuePosition,
   cleanupJobs,
+  removeJobsFromMemory,
 };

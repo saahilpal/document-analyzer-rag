@@ -1,6 +1,5 @@
-const fs = require('fs/promises');
 const crypto = require('crypto');
-const { extractTextFromPdfBuffer } = require('./pdfService');
+const { parseFile } = require('../parsers');
 const { chunkText } = require('./chunkService');
 const { generateEmbeddings } = require('./embeddingService');
 const { addChunks } = require('./vectorService');
@@ -73,8 +72,10 @@ async function indexPdfById(pdfId, options = {}) {
 
   try {
     reportProgress(onProgress, 'parsing', 10);
-    const fileBuffer = await fs.readFile(pdf.path);
-    const rawText = await extractTextFromPdfBuffer(fileBuffer);
+    const rawText = await parseFile({
+      filePath: pdf.path,
+      fileType: pdf.type,
+    });
     reportProgress(onProgress, 'chunking', 35);
     const indexingParams = getIndexingParams(rawText);
     const chunks = chunkText(rawText, {

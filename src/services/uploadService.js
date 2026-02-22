@@ -5,10 +5,33 @@ const path = require('path');
 const uploadsRoot = path.resolve(process.cwd(), 'data', 'uploads');
 const tempUploadsRoot = path.join(uploadsRoot, '.tmp');
 const MAX_UPLOAD_FILE_SIZE_BYTES = Number(process.env.MAX_UPLOAD_FILE_SIZE_BYTES) || 50 * 1024 * 1024;
-const ALLOWED_PDF_MIME_TYPES = new Set(['application/pdf', 'application/x-pdf']);
+
+const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+  'text/plain',
+  'text/markdown',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'text/csv',
+  'application/pdf',
+]);
+
+const MIME_TO_FILE_TYPE = {
+  'text/plain': 'txt',
+  'text/markdown': 'md',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'text/csv': 'csv',
+  'application/pdf': 'pdf',
+};
+
+const FILE_TYPE_TO_EXTENSION = {
+  txt: 'txt',
+  md: 'md',
+  docx: 'docx',
+  csv: 'csv',
+  pdf: 'pdf',
+};
 
 function sanitizeFilename(filename) {
-  return String(filename || 'upload.pdf')
+  return String(filename || 'upload.bin')
     .replace(/[^a-zA-Z0-9._-]/g, '_')
     .replace(/_+/g, '_');
 }
@@ -25,6 +48,13 @@ function createUploadPathError() {
   return error;
 }
 
+function createUploadValidationError(statusCode, code, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
 async function ensureSessionUploadDir(sessionId) {
   const dir = path.join(uploadsRoot, String(sessionId));
   await fs.mkdir(dir, { recursive: true });
@@ -36,58 +66,135 @@ async function ensureTempUploadDir() {
   return tempUploadsRoot;
 }
 
-async function readPdfSignature(filePath) {
+async function readFileSignature(filePath, byteLength = 8192) {
   const handle = await fs.open(filePath, 'r');
   try {
-    const buffer = Buffer.alloc(5);
-    await handle.read(buffer, 0, 5, 0);
-    return buffer.toString('ascii');
+    const buffer = Buffer.alloc(byteLength);
+    const { bytesRead } = await handle.read(buffer, 0, byteLength, 0);
+    return buffer.subarray(0, bytesRead);
   } finally {
     await handle.close();
   }
 }
 
-async function ensurePdfUploadFile(file) {
-  const mimetype = String(file?.mimetype || '').toLowerCase();
-  const originalname = String(file?.originalname || '').toLowerCase();
+function isZipSignature(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4) {
+    return false;
+  }
+
+  const signature = buffer.subarray(0, 4);
+  const zipSignatures = [
+    Buffer.from([0x50, 0x4B, 0x03, 0x04]),
+    Buffer.from([0x50, 0x4B, 0x05, 0x06]),
+    Buffer.from([0x50, 0x4B, 0x07, 0x08]),
+  ];
+
+  return zipSignatures.some((candidate) => signature.equals(candidate));
+}
+
+function isLikelyUtf8Text(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return false;
+  }
+
+  if (buffer.includes(0x00)) {
+    return false;
+  }
+
+  let decoded;
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+  } catch {
+    return false;
+  }
+
+  let disallowedControlCount = 0;
+  for (let i = 0; i < decoded.length; i += 1) {
+    const code = decoded.charCodeAt(i);
+    const isControl = code < 32;
+    const isAllowedControl = code === 9 || code === 10 || code === 13 || code === 12;
+    if (isControl && !isAllowedControl) {
+      disallowedControlCount += 1;
+    }
+  }
+
+  return disallowedControlCount === 0;
+}
+
+function detectSignatureType(signatureBuffer) {
+  if (!Buffer.isBuffer(signatureBuffer) || signatureBuffer.length === 0) {
+    return 'unknown';
+  }
+
+  if (signatureBuffer.length >= 5 && signatureBuffer.subarray(0, 5).toString('ascii') === '%PDF-') {
+    return 'pdf';
+  }
+
+  if (isZipSignature(signatureBuffer)) {
+    return 'zip';
+  }
+
+  if (isLikelyUtf8Text(signatureBuffer)) {
+    return 'text';
+  }
+
+  return 'binary';
+}
+
+function assertTypeSignatureCompatibility(fileType, signatureType) {
+  if (fileType === 'pdf' && signatureType !== 'pdf') {
+    throw createUploadValidationError(400, 'INVALID_FILE_SIGNATURE', 'Invalid PDF file signature.');
+  }
+
+  if (fileType === 'docx' && signatureType !== 'zip') {
+    throw createUploadValidationError(400, 'INVALID_FILE_SIGNATURE', 'Invalid DOCX file signature.');
+  }
+
+  if ((fileType === 'txt' || fileType === 'md' || fileType === 'csv') && signatureType !== 'text') {
+    throw createUploadValidationError(400, 'INVALID_FILE_SIGNATURE', 'Invalid text file signature or encoding.');
+  }
+}
+
+async function inspectUploadedFile(file) {
+  const mimetype = String(file?.mimetype || '').toLowerCase().trim();
+  const originalname = String(file?.originalname || 'upload.bin').toLowerCase().trim();
   const filePath = String(file?.path || '');
   const fileSize = Number(file?.size || 0);
 
   if (!filePath) {
-    const error = new Error('Uploaded file path is missing.');
-    error.statusCode = 400;
-    error.code = 'MISSING_UPLOAD_FILE';
-    throw error;
+    throw createUploadValidationError(400, 'MISSING_UPLOAD_FILE', 'Uploaded file path is missing.');
   }
 
-  if (!ALLOWED_PDF_MIME_TYPES.has(mimetype)) {
-    const error = new Error('Invalid MIME type. Only PDF uploads are allowed.');
-    error.statusCode = 415;
-    error.code = 'INVALID_FILE_MIME';
-    throw error;
-  }
-
-  if (!originalname.endsWith('.pdf')) {
-    const error = new Error('File extension must be .pdf.');
-    error.statusCode = 400;
-    error.code = 'INVALID_FILE_EXTENSION';
-    throw error;
+  if (!ALLOWED_UPLOAD_MIME_TYPES.has(mimetype)) {
+    throw createUploadValidationError(415, 'INVALID_FILE_MIME', 'Unsupported MIME type for uploaded file.');
   }
 
   if (fileSize <= 0 || fileSize > MAX_UPLOAD_FILE_SIZE_BYTES) {
-    const error = new Error('Uploaded file exceeds configured size limit.');
-    error.statusCode = 400;
-    error.code = 'UPLOAD_TOO_LARGE';
-    throw error;
+    throw createUploadValidationError(400, 'UPLOAD_TOO_LARGE', 'Uploaded file exceeds configured size limit.');
   }
 
-  const signature = await readPdfSignature(filePath);
-  if (signature !== '%PDF-') {
-    const error = new Error('Invalid PDF file signature.');
-    error.statusCode = 400;
-    error.code = 'INVALID_FILE_SIGNATURE';
-    throw error;
+  const fileType = MIME_TO_FILE_TYPE[mimetype];
+  if (!fileType) {
+    throw createUploadValidationError(415, 'INVALID_FILE_MIME', 'Unsupported MIME type for uploaded file.');
   }
+
+  const signatureBuffer = await readFileSignature(filePath);
+  const signatureType = detectSignatureType(signatureBuffer);
+  assertTypeSignatureCompatibility(fileType, signatureType);
+
+  const extension = FILE_TYPE_TO_EXTENSION[fileType];
+  if (!extension) {
+    throw createUploadValidationError(415, 'UNSUPPORTED_FILE_TYPE', 'Unsupported uploaded file type.');
+  }
+
+  return {
+    fileType,
+    extension,
+    mimetype,
+    originalname,
+    signatureType,
+    fileSize,
+  };
 }
 
 async function moveFileExclusive(sourcePath, targetPath) {
@@ -99,7 +206,7 @@ async function moveFileExclusive(sourcePath, targetPath) {
 
   try {
     await fs.access(normalizedTarget);
-    const collisionError = new Error('PDF file collision detected. Retry upload.');
+    const collisionError = new Error('File collision detected. Retry upload.');
     collisionError.statusCode = 400;
     collisionError.code = 'UPLOAD_FILE_COLLISION';
     throw collisionError;
@@ -121,10 +228,10 @@ async function moveFileExclusive(sourcePath, targetPath) {
   }
 }
 
-async function saveUploadedPdfById({ sessionId, pdfId, file }) {
-  await ensurePdfUploadFile(file);
+async function saveUploadedFileById({ sessionId, pdfId, file, detectedFile = null }) {
+  const inspected = detectedFile || await inspectUploadedFile(file);
 
-  const filename = `${pdfId}.pdf`;
+  const filename = `${pdfId}.${inspected.extension}`;
   const sessionDir = await ensureSessionUploadDir(sessionId);
   const absolutePath = path.join(sessionDir, filename);
 
@@ -137,6 +244,7 @@ async function saveUploadedPdfById({ sessionId, pdfId, file }) {
   return {
     filename,
     storagePath: absolutePath,
+    fileType: inspected.fileType,
   };
 }
 
@@ -195,10 +303,15 @@ async function cleanupTempUploadsOlderThan(maxAgeMs) {
 module.exports = {
   uploadsRoot,
   tempUploadsRoot,
+  MAX_UPLOAD_FILE_SIZE_BYTES,
+  ALLOWED_UPLOAD_MIME_TYPES,
   isPathWithinUploadsRoot,
   sanitizeFilename,
   ensureTempUploadDir,
-  saveUploadedPdfById,
+  inspectUploadedFile,
+  saveUploadedFileById,
+  // Backward-compatible alias while route names still reference PDFs.
+  saveUploadedPdfById: saveUploadedFileById,
   removeStoredPdf,
   removeTempUpload,
   cleanupTempUploadsOlderThan,

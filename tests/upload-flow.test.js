@@ -3,16 +3,20 @@ const assert = require('node:assert/strict');
 const fs = require('fs/promises');
 const request = require('supertest');
 const app = require('../src/app');
-const { buildSamplePdfBuffer } = require('./helpers');
+const { createAuthContext, buildSamplePdfBuffer } = require('./helpers');
 
 test('upload flow persists PDF and returns processing metadata', async () => {
+  const auth = await createAuthContext(app);
+
   const session = await request(app)
     .post('/api/v1/sessions')
+    .set(auth.authHeader)
     .send({ title: `Upload Flow ${Date.now()}` });
   assert.equal(session.status, 200);
 
   const upload = await request(app)
     .post(`/api/v1/sessions/${session.body.data.id}/pdfs`)
+    .set(auth.authHeader)
     .attach('file', await buildSamplePdfBuffer(), { filename: 'upload-flow.pdf', contentType: 'application/pdf' })
     .field('title', 'Upload Flow PDF');
 
@@ -23,7 +27,9 @@ test('upload flow persists PDF and returns processing metadata', async () => {
   assert.equal(typeof upload.body.data.progress, 'number');
   assert.equal(typeof upload.body.data.stage, 'string');
 
-  const pdfInfo = await request(app).get(`/api/v1/pdfs/${upload.body.data.pdfId}`);
+  const pdfInfo = await request(app)
+    .get(`/api/v1/pdfs/${upload.body.data.pdfId}`)
+    .set(auth.authHeader);
   assert.equal(pdfInfo.status, 200);
   const storagePath = pdfInfo.body.data.path;
   assert.equal(typeof storagePath, 'string');

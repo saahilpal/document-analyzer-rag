@@ -1,5 +1,7 @@
 // Simple in-memory rate limiter suitable for local development.
 // For production with multiple instances, use Redis or another shared store.
+const { toErrorObject } = require('../utils/errors');
+
 const requestStore = new Map();
 const MAX_TRACKED_IPS = 10_000;
 
@@ -42,7 +44,11 @@ function rateLimiter({ windowMs = 60_000, maxRequests = 60 } = {}) {
       res.setHeader('Retry-After', String(retryAfterSeconds));
       return res.status(429).json({
         ok: false,
-        error: `Rate limit exceeded. Try again in ${retryAfterSeconds}s.`,
+        error: toErrorObject({
+          code: 'RATE_LIMITED',
+          message: `Rate limit exceeded. Try again in ${retryAfterSeconds}s.`,
+          retryable: true,
+        }, 429),
       });
     }
 
@@ -50,4 +56,9 @@ function rateLimiter({ windowMs = 60_000, maxRequests = 60 } = {}) {
   };
 }
 
+function resetRateLimiterStoreForTests() {
+  requestStore.clear();
+}
+
 module.exports = rateLimiter;
+module.exports.__resetRateLimiterStoreForTests = resetRateLimiterStoreForTests;

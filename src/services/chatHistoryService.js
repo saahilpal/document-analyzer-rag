@@ -2,15 +2,15 @@ const db = require('../db/database');
 const ALLOWED_ROLES = new Set(['user', 'assistant', 'system']);
 
 const insertMessageStmt = db.prepare(`
-  INSERT INTO chat_messages (sessionId, role, text, createdAt)
-  VALUES (@sessionId, @role, @text, @createdAt)
+  INSERT INTO chat_messages (user_id, sessionId, role, text, createdAt)
+  VALUES (@userId, @sessionId, @role, @text, @createdAt)
 `);
 
 const updateSessionMessageMetadataStmt = db.prepare(`
   UPDATE sessions
   SET last_message_at = @createdAt,
       last_message_preview = @lastMessagePreview
-  WHERE id = @sessionId
+  WHERE id = @sessionId AND user_id = @userId
 `);
 
 const listMessagesStmt = db.prepare(`
@@ -20,7 +20,7 @@ const listMessagesStmt = db.prepare(`
     text,
     COALESCE(NULLIF(createdAt, ''), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) AS createdAt
   FROM chat_messages
-  WHERE sessionId = @sessionId
+  WHERE sessionId = @sessionId AND user_id = @userId
   ORDER BY createdAt ASC, id ASC
   LIMIT @limit
   OFFSET @offset
@@ -28,32 +28,42 @@ const listMessagesStmt = db.prepare(`
 
 const deleteMessagesStmt = db.prepare(`
   DELETE FROM chat_messages
-  WHERE sessionId = ?
+  WHERE sessionId = ? AND user_id = ?
 `);
 
 const clearSessionMessageMetadataStmt = db.prepare(`
   UPDATE sessions
   SET last_message_at = NULL,
       last_message_preview = NULL
-  WHERE id = ?
+  WHERE id = ? AND user_id = ?
 `);
 
-const addMessageTx = db.transaction(({ sessionId, role, text, createdAt }) => {
+const addMessageTx = db.transaction(({ userId, sessionId, role, text, createdAt }) => {
   insertMessageStmt.run({
+    userId,
     sessionId,
     role,
     text,
     createdAt,
   });
   updateSessionMessageMetadataStmt.run({
+    userId,
     sessionId,
     createdAt,
     lastMessagePreview: String(text).slice(0, 160),
   });
 });
 
-const addConversationTx = db.transaction(({ sessionId, userText, assistantText, userCreatedAt, assistantCreatedAt }) => {
+const addConversationTx = db.transaction(({
+  userId,
+  sessionId,
+  userText,
+  assistantText,
+  userCreatedAt,
+  assistantCreatedAt,
+}) => {
   insertMessageStmt.run({
+    userId,
     sessionId,
     role: 'user',
     text: userText,
@@ -61,6 +71,7 @@ const addConversationTx = db.transaction(({ sessionId, userText, assistantText, 
   });
 
   insertMessageStmt.run({
+    userId,
     sessionId,
     role: 'assistant',
     text: assistantText,
@@ -68,6 +79,7 @@ const addConversationTx = db.transaction(({ sessionId, userText, assistantText, 
   });
 
   updateSessionMessageMetadataStmt.run({
+    userId,
     sessionId,
     createdAt: assistantCreatedAt,
     lastMessagePreview: String(assistantText).slice(0, 160),
@@ -84,7 +96,18 @@ function normalizeMessageText(text) {
   return normalizedText;
 }
 
-function addMessage({ sessionId, role, text, createdAt }) {
+function normalizeUserId(userId) {
+  const normalizedUserId = Number(userId);
+  if (!Number.isInteger(normalizedUserId) || normalizedUserId <= 0) {
+    const error = new Error('userId must be a positive integer.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalizedUserId;
+}
+
+function addMessage({ userId, sessionId, role, text, createdAt }) {
+  const normalizedUserId = normalizeUserId(userId);
   if (!ALLOWED_ROLES.has(role)) {
     const error = new Error('Invalid chat role.');
     error.statusCode = 400;
@@ -94,6 +117,7 @@ function addMessage({ sessionId, role, text, createdAt }) {
 
   const timestamp = createdAt || new Date().toISOString();
   addMessageTx({
+    userId: normalizedUserId,
     sessionId,
     role,
     text: normalizedText,
@@ -101,13 +125,15 @@ function addMessage({ sessionId, role, text, createdAt }) {
   });
 }
 
-function addConversation({ sessionId, userText, assistantText, createdAt }) {
+function addConversation({ userId, sessionId, userText, assistantText, createdAt }) {
+  const normalizedUserId = normalizeUserId(userId);
   const normalizedUserText = normalizeMessageText(userText);
   const normalizedAssistantText = normalizeMessageText(assistantText);
   const userCreatedAt = createdAt || new Date().toISOString();
   const assistantCreatedAt = new Date(new Date(userCreatedAt).getTime() + 1).toISOString();
 
   addConversationTx({
+    userId: normalizedUserId,
     sessionId,
     userText: normalizedUserText,
     assistantText: normalizedAssistantText,
@@ -116,7 +142,8 @@ function addConversation({ sessionId, userText, assistantText, createdAt }) {
   });
 }
 
-function listSessionHistory(sessionId, options = {}) {
+function listSessionHistory(sessionId, userId, options = {}) {
+  const normalizedUserId = normalizeUserId(userId);
   const requestedLimit = Number(options.limit ?? 1000);
   const requestedOffset = Number(options.offset ?? 0);
   const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
@@ -127,7 +154,7 @@ function listSessionHistory(sessionId, options = {}) {
     : 0;
 
   return listMessagesStmt
-    .all({ sessionId, limit, offset })
+    .all({ sessionId, userId: normalizedUserId, limit, offset })
     .map((row) => ({
       id: String(row.id),
       role: row.role,
@@ -136,12 +163,13 @@ function listSessionHistory(sessionId, options = {}) {
     }));
 }
 
-function clearSessionHistory(sessionId) {
-  const clearTx = db.transaction((id) => {
-    deleteMessagesStmt.run(id);
-    clearSessionMessageMetadataStmt.run(id);
+function clearSessionHistory(sessionId, userId) {
+  const normalizedUserId = normalizeUserId(userId);
+  const clearTx = db.transaction((id, ownerId) => {
+    deleteMessagesStmt.run(id, ownerId);
+    clearSessionMessageMetadataStmt.run(id, ownerId);
   });
-  clearTx(sessionId);
+  clearTx(sessionId, normalizedUserId);
   return { cleared: true };
 }
 

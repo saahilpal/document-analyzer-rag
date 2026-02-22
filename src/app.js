@@ -63,15 +63,14 @@ app.use(cors({
     return callback(error);
   },
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept'],
+  allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
   credentials: false,
 }));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 
-// Authentication has been intentionally removed in this phase to support a local-first academic deployment.
-// The backend is structured to allow seamless reintroduction of JWT-based authentication in future iterations without architectural changes.
+// Route-level authentication is applied inside /api/v1 router.
 app.use('/api/v1', rateLimiter({ windowMs: 60_000, maxRequests: 100 }), apiV1Route);
 
 app.use((err, req, res, next) => {

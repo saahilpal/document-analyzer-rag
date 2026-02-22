@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const db = require('../src/db/database');
 const { createSession, deleteSession } = require('../src/services/sessionService');
 const { createPdfRecord } = require('../src/services/pdfRecordService');
+const { createUser } = require('../src/services/authService');
 const { addChunks } = require('../src/services/vectorService');
 
 const countChunksByPdfStmt = db.prepare(`
@@ -12,8 +13,14 @@ const countChunksByPdfStmt = db.prepare(`
 `);
 
 test('re-indexing same pdf does not duplicate chunks', async () => {
-  const session = createSession(`Idempotent Indexing ${Date.now()}`);
+  const user = await createUser({
+    name: `Indexing User ${Date.now()}`,
+    email: `indexing_${Date.now()}_${Math.random().toString(16).slice(2, 8)}@example.com`,
+    password: 'SecurePass123!',
+  });
+  const session = createSession(user.id, `Idempotent Indexing ${Date.now()}`);
   const pdf = createPdfRecord({
+    userId: user.id,
     sessionId: session.id,
     title: 'Idempotent PDF',
     filename: 'idempotent.pdf',
@@ -59,5 +66,5 @@ test('re-indexing same pdf does not duplicate chunks', async () => {
   assert.equal(afterFirstReindex, 3);
   assert.equal(afterSecondReindex, 3);
 
-  deleteSession(session.id);
+  deleteSession(session.id, user.id);
 });

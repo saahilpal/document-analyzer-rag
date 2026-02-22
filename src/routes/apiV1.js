@@ -5,10 +5,20 @@ const multer = require('multer');
 const { z } = require('zod');
 const {
   listSessions,
+  searchSessionsByTitle,
   createSession,
+  renameSession,
+  getSessionMetadata,
   assertSessionExists,
   deleteSession,
 } = require('../services/sessionService');
+const {
+  createUser,
+  authenticateUser,
+  createAuthSession,
+  deleteAuthSessionById,
+  toPublicUser,
+} = require('../services/authService');
 const {
   createPdfRecord,
   updatePdfStorage,
@@ -21,15 +31,17 @@ const {
   uploadsRoot,
   sanitizeFilename,
   ensureTempUploadDir,
-  saveUploadedPdfById,
+  inspectUploadedFile,
+  saveUploadedFileById,
   removeStoredPdf,
   removeTempUpload,
 } = require('../services/uploadService');
 const {
   addJob,
-  getJob,
+  getJobForUser,
   getQueueState,
   getQueuePosition,
+  removeJobsFromMemory,
 } = require('../services/jobQueue');
 const {
   runChatQuery,
@@ -41,6 +53,7 @@ const { addConversation, listSessionHistory, clearSessionHistory } = require('..
 const { getMetrics, recordQuery } = require('../services/metricsService');
 const rateLimiter = require('../middleware/rateLimiter');
 const validateSchema = require('../middleware/validate');
+const requireAuth = require('../middleware/requireAuth');
 const { ok, fail } = require('./helpers');
 const asyncHandler = require('../utils/asyncHandler');
 const { createHttpError, normalizeHttpError } = require('../utils/errors');
@@ -70,6 +83,17 @@ const createSessionBodySchema = z.object({
   title: z.string().min(1).max(160),
 });
 
+const registerBodySchema = z.object({
+  name: z.string().min(1).max(120),
+  email: z.string().email().max(320),
+  password: z.string().min(8).max(128),
+});
+
+const loginBodySchema = z.object({
+  email: z.string().email().max(320),
+  password: z.string().min(8).max(128),
+});
+
 const chatBodySchema = z.object({
   message: z.string().min(1).max(10_000),
   history: z.array(z.object({
@@ -77,6 +101,14 @@ const chatBodySchema = z.object({
     text: z.string(),
   })).max(100).optional(),
   responseStyle: z.enum(['structured', 'plain']).optional(),
+});
+
+const renameSessionBodySchema = z.object({
+  title: z.string().trim().min(1).max(60),
+});
+
+const sessionSearchQuerySchema = z.object({
+  q: z.string().max(160).optional(),
 });
 
 const historyQuerySchema = z.object({
@@ -94,6 +126,8 @@ const strictReadLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 200 });
 const writeLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 80 });
 const uploadLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 16 });
 const chatLimiter = rateLimiter({ windowMs: 60_000, maxRequests: 30 });
+const registerLimiter = rateLimiter({ windowMs: 15 * 60_000, maxRequests: 30 });
+const loginLimiter = rateLimiter({ windowMs: 15 * 60_000, maxRequests: 20 });
 
 function normalizeMulterError(error) {
   if (error?.name === 'MulterError') {
@@ -136,7 +170,7 @@ function normalizeOptionalTitle(title, fallback) {
   if (normalized) {
     return normalized;
   }
-  return sanitizeFilename(fallback || 'uploaded.pdf').replace(/\.pdf$/i, '');
+  return sanitizeFilename(fallback || 'uploaded').replace(/\.[a-z0-9]{1,12}$/i, '');
 }
 
 function shouldStreamChat(req) {
@@ -160,6 +194,51 @@ function writeSseEvent(res, event, payload) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
+
+function getClientMetadata(req) {
+  return {
+    deviceInfo: String(req.headers['user-agent'] || '').trim() || null,
+    ipAddress: String(req.ip || '').trim() || null,
+  };
+}
+
+router.post('/auth/register', registerLimiter, validateSchema(registerBodySchema), asyncHandler(async (req, res) => {
+  const user = await createUser({
+    name: req.body.name,
+    email: req.body.email,
+    password: req.body.password,
+  });
+
+  const authSession = createAuthSession({
+    userId: user.id,
+    ...getClientMetadata(req),
+  });
+
+  return ok(res, {
+    token: authSession.token,
+    expiresAt: authSession.expiresAt,
+    user: toPublicUser(user),
+  });
+}));
+
+router.post('/auth/login', loginLimiter, validateSchema(loginBodySchema), asyncHandler(async (req, res) => {
+  const user = await authenticateUser({
+    email: req.body.email,
+    password: req.body.password,
+    ipAddress: req.ip,
+  });
+
+  const authSession = createAuthSession({
+    userId: user.id,
+    ...getClientMetadata(req),
+  });
+
+  return ok(res, {
+    token: authSession.token,
+    expiresAt: authSession.expiresAt,
+    user: toPublicUser(user),
+  });
+}));
 
 router.get('/health', strictReadLimiter, (req, res) => {
   const queueState = getQueueState();
@@ -186,27 +265,77 @@ router.get('/health', strictReadLimiter, (req, res) => {
 });
 router.get('/ping', strictReadLimiter, (req, res) => ok(res, { pong: true }));
 
-router.get('/sessions', strictReadLimiter, (req, res) => ok(res, listSessions()));
+router.use(requireAuth);
+
+router.get('/auth/me', strictReadLimiter, (req, res) => {
+  return ok(res, {
+    id: req.user.id,
+    name: req.user.name,
+    email: req.user.email,
+    created_at: req.user.createdAt,
+  });
+});
+
+router.delete('/auth/session', writeLimiter, (req, res) => {
+  deleteAuthSessionById(req.authSession.id);
+  return ok(res, { loggedOut: true });
+});
+
+router.get('/sessions', strictReadLimiter, (req, res) => ok(res, listSessions(req.user.id)));
 
 router.post('/sessions', writeLimiter, validateSchema(createSessionBodySchema), (req, res) => {
   const title = req.body.title.trim();
 
-  const session = createSession(title);
+  const session = createSession(req.user.id, title);
   return ok(res, session);
+});
+
+router.get('/sessions/search', strictReadLimiter, validateSchema(sessionSearchQuerySchema, 'query'), (req, res) => {
+  const query = String(req.query.q || '').trim();
+  if (!query) {
+    return ok(res, []);
+  }
+  return ok(res, searchSessionsByTitle(req.user.id, query, { limit: 50 }));
+});
+
+router.patch('/sessions/:sessionId', writeLimiter, validateSchema(renameSessionBodySchema), (req, res) => {
+  const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
+  const session = renameSession(sessionId, req.user.id, req.body.title);
+  return ok(res, session);
+});
+
+router.get('/sessions/:sessionId/meta', strictReadLimiter, (req, res) => {
+  const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
+  return ok(res, getSessionMetadata(sessionId, req.user.id));
 });
 
 router.get('/sessions/:sessionId', strictReadLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  const session = assertSessionExists(sessionId);
-  const pdfs = listPdfsBySession(sessionId);
+  const session = assertSessionExists(sessionId, req.user.id);
+  const pdfs = listPdfsBySession(sessionId, req.user.id);
   return ok(res, { ...session, pdfs });
 });
 
-router.delete('/sessions/:sessionId', writeLimiter, (req, res) => {
+router.delete('/sessions/:sessionId', writeLimiter, asyncHandler(async (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  const result = deleteSession(sessionId);
-  return ok(res, result);
-});
+  const result = deleteSession(sessionId, req.user.id);
+  removeJobsFromMemory(result.deletedJobIds);
+
+  for (const storagePath of result.deletedPdfPaths) {
+    await removeStoredPdf(storagePath).catch((error) => {
+      if (error?.code === 'ENOENT') {
+        return;
+      }
+      logError('ERROR_UPLOAD', error, {
+        route: '/api/v1/sessions/:sessionId',
+        sessionId,
+        stage: 'removeSessionPdfFile',
+      });
+    });
+  }
+
+  return ok(res, { deleted: true, id: result.id });
+}));
 
 router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
   upload.single('file')(req, res, async (uploadErr) => {
@@ -214,7 +343,7 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
     try {
       normalizeMulterError(uploadErr);
       const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-      assertSessionExists(sessionId);
+      assertSessionExists(sessionId, req.user.id);
 
       if (!req.file) {
         throw createHttpError(400, 'MISSING_UPLOAD_FILE', 'file is required as multipart form-data.');
@@ -228,19 +357,23 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
         fileSize: req.file.size,
       });
 
+      const detectedFile = await inspectUploadedFile(req.file);
+
       const pdf = createPdfRecord({
+        userId: req.user.id,
         sessionId,
         title: normalizeOptionalTitle(req.body.title, req.file.originalname),
-        filename: 'pending.pdf',
+        filename: `pending.${detectedFile.extension}`,
         storagePath: '',
-        type: 'pdf',
+        type: detectedFile.fileType,
       });
 
       try {
-        const { filename, storagePath } = await saveUploadedPdfById({
+        const { filename, storagePath } = await saveUploadedFileById({
           sessionId,
           pdfId: pdf.id,
           file: req.file,
+          detectedFile,
         });
 
         updatePdfStorage(pdf.id, { filename, storagePath });
@@ -249,12 +382,13 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
           route: '/api/v1/sessions/:sessionId/pdfs',
           sessionId,
         });
-        deletePdfRecord(pdf.id);
+        deletePdfRecord(pdf.id, req.user.id);
         throw error;
       }
 
       const indexJob = addJob({
         type: 'indexPdf',
+        userId: req.user.id,
         pdfId: pdf.id,
         maxRetries: 3,
       });
@@ -283,7 +417,7 @@ router.post('/sessions/:sessionId/pdfs', uploadLimiter, (req, res, next) => {
 
 router.get('/pdfs/:pdfId', strictReadLimiter, (req, res) => {
   const pdfId = parsePositiveInt(req.params.pdfId, 'pdfId');
-  const pdf = assertPdfExists(pdfId);
+  const pdf = assertPdfExists(pdfId, req.user.id);
   return ok(res, pdf);
 });
 
@@ -291,7 +425,7 @@ router.delete('/pdfs/:pdfId', writeLimiter, asyncHandler(async (req, res) => {
   const pdfId = parsePositiveInt(req.params.pdfId, 'pdfId');
   const removeFile = String(req.query.removeFile || 'false').toLowerCase() === 'true';
 
-  const pdf = assertPdfExists(pdfId);
+  const pdf = assertPdfExists(pdfId, req.user.id);
   if (removeFile) {
     try {
       await removeStoredPdf(pdf.path);
@@ -303,25 +437,25 @@ router.delete('/pdfs/:pdfId', writeLimiter, asyncHandler(async (req, res) => {
     }
   }
 
-  const result = deletePdfRecord(pdfId);
+  const result = deletePdfRecord(pdfId, req.user.id);
   return ok(res, result);
 }));
 
 router.get('/sessions/:sessionId/pdfs', strictReadLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  assertSessionExists(sessionId);
-  return ok(res, listPdfsBySession(sessionId));
+  assertSessionExists(sessionId, req.user.id);
+  return ok(res, listPdfsBySession(sessionId, req.user.id));
 });
 
 router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySchema), asyncHandler(async (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  const session = assertSessionExists(sessionId);
+  const session = assertSessionExists(sessionId, req.user.id);
   const message = req.body.message.trim();
   const { history } = req.body;
   const responseStyle = normalizeResponseStyle(req.body.responseStyle);
 
   const normalizedHistory = validateHistory(history);
-  const readiness = getPdfReadinessBySession(sessionId);
+  const readiness = getPdfReadinessBySession(sessionId, req.user.id);
   if (readiness.uploaded === 0 || readiness.indexed === 0 || readiness.processing > 0 || readiness.failed > 0) {
     return fail(
       res,
@@ -389,6 +523,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
       if (!clientDisconnected) {
         try {
           addConversation({
+            userId: req.user.id,
             sessionId,
             userText: message,
             assistantText: response.answer,
@@ -431,6 +566,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
   if (shouldRunAsyncChat({ sessionId, history: normalizedHistory })) {
     const job = addJob({
       type: 'chatQuery',
+      userId: req.user.id,
       sessionId,
       message,
       history: normalizedHistory,
@@ -460,6 +596,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
   recordQuery({ queryTimeMs: durationMs });
   try {
     addConversation({
+      userId: req.user.id,
       sessionId,
       userText: message,
       assistantText: response.answer,
@@ -483,7 +620,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
 }));
 
 router.get('/jobs/:jobId', strictReadLimiter, (req, res) => {
-  const job = getJob(req.params.jobId);
+  const job = getJobForUser(req.params.jobId, req.user.id);
   if (!job) {
     throw createHttpError(400, 'UNKNOWN_JOB_ID', 'jobId does not exist.');
   }
@@ -504,16 +641,16 @@ router.get('/jobs/:jobId', strictReadLimiter, (req, res) => {
 
 router.get('/sessions/:sessionId/history', strictReadLimiter, validateSchema(historyQuerySchema, 'query'), (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  assertSessionExists(sessionId);
+  assertSessionExists(sessionId, req.user.id);
   const limit = req.query.limit !== undefined ? Number(req.query.limit) : undefined;
   const offset = req.query.offset !== undefined ? Number(req.query.offset) : undefined;
-  return ok(res, listSessionHistory(sessionId, { limit, offset }));
+  return ok(res, listSessionHistory(sessionId, req.user.id, { limit, offset }));
 });
 
 router.delete('/sessions/:sessionId/history', writeLimiter, (req, res) => {
   const sessionId = parsePositiveInt(req.params.sessionId, 'sessionId');
-  assertSessionExists(sessionId);
-  return ok(res, clearSessionHistory(sessionId));
+  assertSessionExists(sessionId, req.user.id);
+  return ok(res, clearSessionHistory(sessionId, req.user.id));
 });
 
 router.get('/admin/queue', strictReadLimiter, (req, res) => {

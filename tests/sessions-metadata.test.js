@@ -4,26 +4,32 @@ const request = require('supertest');
 const app = require('../src/app');
 const { createSession } = require('../src/services/sessionService');
 const { addMessage } = require('../src/services/chatHistoryService');
+const { createAuthContext } = require('./helpers');
 
 test('GET /api/v1/sessions returns metadata sorted by lastMessageAt desc', async () => {
-  const first = createSession(`Sort A ${Date.now()}`);
-  const second = createSession(`Sort B ${Date.now()}`);
-  const third = createSession(`Sort C ${Date.now()}`);
+  const auth = await createAuthContext(app);
+  const first = createSession(auth.user.id, `Sort A ${Date.now()}`);
+  const second = createSession(auth.user.id, `Sort B ${Date.now()}`);
+  const third = createSession(auth.user.id, `Sort C ${Date.now()}`);
 
   addMessage({
+    userId: auth.user.id,
     sessionId: first.id,
     role: 'user',
     text: 'first-old',
     createdAt: '2026-01-01T00:00:00.000Z',
   });
   addMessage({
+    userId: auth.user.id,
     sessionId: third.id,
     role: 'assistant',
     text: 'third-newer',
     createdAt: '2026-01-02T00:00:00.000Z',
   });
 
-  const response = await request(app).get('/api/v1/sessions');
+  const response = await request(app)
+    .get('/api/v1/sessions')
+    .set(auth.authHeader);
 
   assert.equal(response.status, 200);
   assert.equal(response.body.ok, true);
@@ -47,28 +53,34 @@ test('GET /api/v1/sessions returns metadata sorted by lastMessageAt desc', async
 });
 
 test('GET /api/v1/sessions/:sessionId/history returns chronological messages with createdAt', async () => {
-  const session = createSession(`History ${Date.now()}`);
+  const auth = await createAuthContext(app);
+  const session = createSession(auth.user.id, `History ${Date.now()}`);
 
   addMessage({
+    userId: auth.user.id,
     sessionId: session.id,
     role: 'assistant',
     text: 'Second with **markdown**',
     createdAt: '2026-01-02T00:00:00.000Z',
   });
   addMessage({
+    userId: auth.user.id,
     sessionId: session.id,
     role: 'system',
     text: 'First *system*',
     createdAt: '2026-01-01T00:00:00.000Z',
   });
   addMessage({
+    userId: auth.user.id,
     sessionId: session.id,
     role: 'user',
     text: 'Third final',
     createdAt: '2026-01-03T00:00:00.000Z',
   });
 
-  const response = await request(app).get(`/api/v1/sessions/${session.id}/history`);
+  const response = await request(app)
+    .get(`/api/v1/sessions/${session.id}/history`)
+    .set(auth.authHeader);
 
   assert.equal(response.status, 200);
   assert.equal(response.body.ok, true);

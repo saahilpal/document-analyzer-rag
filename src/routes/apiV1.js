@@ -15,10 +15,18 @@ const {
 const {
   createUser,
   authenticateUser,
-  createAuthSession,
+  createJWTAuthSession,
   deleteAuthSessionById,
   toPublicUser,
+  requestOTP,
+  verifyOTP,
+  rotateRefreshToken,
+  requestPasswordReset,
+  executePasswordReset,
+  activateUser,
+  updateUserEmail,
 } = require('../services/authService');
+const { sendEmail } = require('../services/emailService');
 const {
   createPdfRecord,
   updatePdfStorage,
@@ -92,6 +100,37 @@ const registerBodySchema = z.object({
 const loginBodySchema = z.object({
   email: z.string().email().max(320),
   password: z.string().min(8).max(128),
+});
+
+const otpBodySchema = z.object({
+  email: z.string().email().max(320),
+});
+
+const verifyOtpBodySchema = z.object({
+  email: z.string().email().max(320),
+  otp: z.string().min(6).max(6),
+});
+
+const refreshBodySchema = z.object({
+  refreshToken: z.string().min(1),
+});
+
+const requestResetBodySchema = z.object({
+  email: z.string().email().max(320),
+});
+
+const resetPasswordBodySchema = z.object({
+  token: z.string().min(1),
+  newPassword: z.string().min(8).max(128),
+});
+
+const changeEmailRequestSchema = z.object({
+  newEmail: z.string().email().max(320),
+});
+
+const performEmailChangeSchema = z.object({
+  newEmail: z.string().email().max(320),
+  otp: z.string().min(6).max(6)
 });
 
 const chatBodySchema = z.object({
@@ -209,17 +248,37 @@ router.post('/auth/register', registerLimiter, validateSchema(registerBodySchema
     password: req.body.password,
   });
 
-  const authSession = createAuthSession({
-    userId: user.id,
-    ...getClientMetadata(req),
-  });
+  if (!user.isActive) {
+    try {
+      await requestOTP(user.email, 'register');
+    } catch (err) {
+      logError('ERROR_EMAIL', err, { route: '/auth/register' });
+    }
+  }
 
-  return ok(res, {
-    token: authSession.token,
-    expiresAt: authSession.expiresAt,
-    user: toPublicUser(user),
-  });
+  return ok(res, { message: 'If account exists, email sent.' });
 }));
+
+router.post('/auth/send-otp', registerLimiter, validateSchema(otpBodySchema), asyncHandler(async (req, res) => {
+  try {
+    await requestOTP(req.body.email, 'register');
+  } catch (err) {
+    logError('ERROR_EMAIL', err, { route: '/auth/send-otp' });
+  }
+  return ok(res, { message: 'If account exists, email sent.' });
+}));
+
+router.post('/auth/verify-otp', registerLimiter, validateSchema(verifyOtpBodySchema), asyncHandler(async (req, res) => {
+  await verifyOTP(req.body.email, 'register', req.body.otp);
+  activateUser(req.body.email);
+  try {
+    await sendEmail('welcome', { to: req.body.email });
+  } catch (err) {
+    logError('ERROR_EMAIL', err, { route: '/auth/verify-otp' });
+  }
+  return ok(res, { message: 'Account verified successfully.' });
+}));
+
 
 router.post('/auth/login', loginLimiter, validateSchema(loginBodySchema), asyncHandler(async (req, res) => {
   const user = await authenticateUser({
@@ -228,16 +287,53 @@ router.post('/auth/login', loginLimiter, validateSchema(loginBodySchema), asyncH
     ipAddress: req.ip,
   });
 
-  const authSession = createAuthSession({
+  if (!user.isActive) {
+    return fail(res, createHttpError(403, 'INACTIVE_ACCOUNT', 'Please verify your email address to log in.'), 403);
+  }
+
+  const { deviceInfo, ipAddress } = getClientMetadata(req);
+
+  const authSession = createJWTAuthSession({
     userId: user.id,
-    ...getClientMetadata(req),
+    deviceInfo,
+    ipAddress,
   });
 
+  try {
+    await sendEmail('alert', { to: user.email, ip: ipAddress, device: deviceInfo });
+  } catch (err) { }
+
   return ok(res, {
-    token: authSession.token,
+    accessToken: authSession.accessToken,
+    refreshToken: authSession.refreshToken,
     expiresAt: authSession.expiresAt,
     user: toPublicUser(user),
   });
+}));
+
+router.post('/auth/refresh', loginLimiter, validateSchema(refreshBodySchema), asyncHandler(async (req, res) => {
+  const { deviceInfo, ipAddress } = getClientMetadata(req);
+  const session = await rotateRefreshToken(req.body.refreshToken, ipAddress);
+
+  return ok(res, {
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt
+  });
+}));
+
+router.post('/auth/request-reset', registerLimiter, validateSchema(requestResetBodySchema), asyncHandler(async (req, res) => {
+  try {
+    await requestPasswordReset(req.body.email);
+  } catch (err) {
+    logError('ERROR_EMAIL', err, { route: '/auth/request-reset' });
+  }
+  return ok(res, { message: 'If account exists, email sent.' });
+}));
+
+router.post('/auth/reset-password', registerLimiter, validateSchema(resetPasswordBodySchema), asyncHandler(async (req, res) => {
+  await executePasswordReset(req.body.token, req.body.newPassword);
+  return ok(res, { message: 'Password reset successfully. Please log in with your new password.' });
 }));
 
 router.get('/health', strictReadLimiter, (req, res) => {
@@ -273,8 +369,44 @@ router.get('/auth/me', strictReadLimiter, (req, res) => {
     name: req.user.name,
     email: req.user.email,
     created_at: req.user.createdAt,
+    is_active: req.user.isActive
   });
 });
+
+router.post('/auth/change-email', writeLimiter, validateSchema(changeEmailRequestSchema), asyncHandler(async (req, res) => {
+  try {
+    await requestOTP(req.body.newEmail, 'change_email');
+  } catch (err) {
+    logError('ERROR_EMAIL', err, { route: '/auth/change-email' });
+  }
+  return ok(res, { message: 'If account exists, email sent.' });
+}));
+
+router.post('/auth/change-email/verify', writeLimiter, validateSchema(performEmailChangeSchema), asyncHandler(async (req, res) => {
+  await verifyOTP(req.body.newEmail, 'change_email', req.body.otp);
+  updateUserEmail(req.user.id, req.body.newEmail);
+  return ok(res, { message: 'Email updated successfully.' });
+}));
+
+router.get('/auth/sessions', strictReadLimiter, asyncHandler(async (req, res) => {
+  const db = require('../db/database');
+  const sessions = db.prepare(`SELECT id, device_info, ip_address, created_at, last_used_at FROM auth_sessions WHERE user_id = ? ORDER BY last_used_at DESC`).all(req.user.id);
+  return ok(res, { sessions });
+}));
+
+router.delete('/auth/sessions/:sessionId', writeLimiter, asyncHandler(async (req, res) => {
+  const db = require('../db/database');
+  const { sessionId } = req.params;
+
+  // We ensure they can only delete their own sessions
+  const session = db.prepare(`SELECT id FROM auth_sessions WHERE id = ? AND user_id = ?`).get(sessionId, req.user.id);
+  if (!session) {
+    throw createHttpError(404, 'NOT_FOUND', 'Session not found.');
+  }
+
+  deleteAuthSessionById(session.id);
+  return ok(res, { deleted: true });
+}));
 
 router.delete('/auth/session', writeLimiter, (req, res) => {
   deleteAuthSessionById(req.authSession.id);

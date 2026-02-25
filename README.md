@@ -1,186 +1,189 @@
-# Document Analyzer RAG Backend
+# Document-Analyzer-RAG 🚀
 
-Production-oriented Node.js + Express backend for authenticated, session-based document ingestion and RAG chat.
+An authentication-free, local-first backend API for high-performance Retrieval-Augmented Generation (RAG) using Node.js, Express, better-sqlite3, and Google Gemini.
 
-## Overview
-This service provides a local-first Retrieval Augmented Generation (RAG) API with:
-- Token-based auth sessions (server-side session store, non-JWT)
-- User-isolated sessions, documents, and chat history
-- Multi-format document upload and indexing (`.pdf`, `.txt`, `.md`, `.docx`, `.csv`)
-- SQLite vector persistence and similarity retrieval
-- Sync + async + streaming (SSE) chat responses
-- Background job queue with progress tracking
+Designed for robust deployment with automated Cloudflare Tunnels, zero-dependency local vector embeddings (via Xenova), and full streaming chat endpoints. Ideal for developers needing a plug-and-play AI-powered document QA system securely stored entirely on local disk.
 
-## Response Contract
-All endpoints return a consistent envelope:
-- Success: `{ ok: true, data: ... }`
-- Error: `{ ok: false, error: { code, message, retryable } }`
+---
 
-## Authentication
-Auth uses opaque bearer tokens with hashed token storage in `auth_sessions`.
+## ✨ Features
 
-Public routes:
-- `POST /api/v1/auth/register`
-- `POST /api/v1/auth/login`
-- `GET /api/v1/health`
-- `GET /api/v1/ping`
+- **Local Vector Store:** Zero database dependencies. Uses a fast, transactional `better-sqlite3` pipeline storing native Float32Array blob buffers directly on your filesystem.
+- **On-Device Embeddings:** Uses Xenova/transformers (`Xenova/all-MiniLM-L6-v2`) inside the Node.js process to convert document text into semantic vectors without hitting external APIs or incurring latency.
+- **Enterprise-Grade Authentication Pipeline:** Full JWT rotation, rolling device tracking, auto-expiring background auth garbage collection, and OTP-based password resets via NodeMailer.
+- **Automated Queuing Pipeline:** In-memory + SQLite-backed asynchronous job worker handles large PDF chunking safely with automatic batch-sizing adjustments and crash-recovery.
+- **Full Chat Streaming (SSE):** Near-instant Server-Sent Events chat response generation securely routed directly from Gemini 2.5 Flash.
+- **Auto-Title Generation:** Gemini automatically reads the first contextual user message to name fresh chat sessions asynchronously to keep UX fast.
+- **Automated Tunnel Infrastructure:** Built-in `start-tunnel.sh` Cloudflare proxy script with auto-healing and a zero-downtime React frontend JSON configurator sync mechanism.
 
-All other `/api/v1/*` routes require:
-- `Authorization: Bearer <token>`
+---
 
-## API Overview
-### Auth
-- `POST /api/v1/auth/register`
-- `POST /api/v1/auth/login`
-- `GET /api/v1/auth/me`
-- `DELETE /api/v1/auth/session`
+## 🏗️ Architecture Overview
 
-### Sessions
-- `GET /api/v1/sessions`
-- `POST /api/v1/sessions`
-- `GET /api/v1/sessions/search?q=term`
-- `PATCH /api/v1/sessions/:sessionId`
-- `GET /api/v1/sessions/:sessionId`
-- `GET /api/v1/sessions/:sessionId/meta`
-- `DELETE /api/v1/sessions/:sessionId`
+The system operates strictly on a modular, service-based MVC structure:
 
-### Documents
-- `GET /api/v1/sessions/:sessionId/pdfs`
-- `POST /api/v1/sessions/:sessionId/pdfs`
-- `GET /api/v1/pdfs/:pdfId`
-- `DELETE /api/v1/pdfs/:pdfId`
+1. **Authentication:** Employs OTP-based stateless JWT session trees. Users register, login, and verify using 6-digit email codes (simulated or SMTP). Sessions track IP and device fingerprinting to permit remote session revocation.
+2. **File Storage & Indexing:** PDFs are ingested via Multer to temporary disk. The `jobQueue.js` assigns a background task to `pdf-parse` the document, tokenize the text via HuggingFace's on-device transformer model, and stream SQLite vector embeddings into local storage.
+3. **Queue System:** Built on a resilient hybrid model. Jobs are tracked in an SQLite `job_queue` table but processed in raw memory arrays. If the server crashes, an auto-boot recovery script reinstates pending jobs and resumes indexing natively.
+4. **Chat & RAG:** Users push chat queries to sessions. The `ragService.js` performs Cosine Similarity against local SQLite blobs, injects the top matching context into a Gemini model prompt, and streams responses to clients using standard `text/event-stream` format.
+5. **Garbage Collection:** A configurable background worker dynamically sweeps the `auth_sessions`, `job_queue`, and temp `/uploads` directories to prune orphaned artifacts and prevent server leakage.
 
-### Chat + History
-- `POST /api/v1/sessions/:sessionId/chat`
-- `GET /api/v1/sessions/:sessionId/history`
-- `DELETE /api/v1/sessions/:sessionId/history`
+---
 
-### Jobs + Ops
-- `GET /api/v1/jobs/:jobId`
-- `GET /api/v1/admin/queue` (disabled in production)
-- `POST /api/v1/admin/reset` (disabled in production)
+## 💻 Tech Stack
 
-## Document Ingestion
-Supported upload MIME types:
-- `application/pdf`
-- `text/plain`
-- `text/markdown`
-- `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
-- `text/csv`
+- **Runtime:** Node.js (Express.js)
+- **Database:** SQLite (`better-sqlite3`)
+- **LLM Provider:** Google GenAI SDK (Gemini-2.5-Flash)
+- **Embeddings Pipeline:** `@xenova/transformers`
+- **Email:** `nodemailer`
+- **Storage Management:** `multer`, `pdf-parse`
 
-Upload flow:
-1. Multipart upload to `/sessions/:sessionId/pdfs`
-2. MIME + signature + size validation
-3. Parser selection by detected file type
-4. Text sanitization/normalization
-5. Existing chunking/embedding/vector pipeline
+---
 
-## Tech Stack
-- Runtime: Node.js (CommonJS)
-- Web: Express
-- DB: SQLite (`better-sqlite3`)
-- Validation: `zod`
-- Auth: `bcryptjs`, crypto token hashing
-- Upload/parsing: `multer`, `pdf-parse`, `mammoth`
-- Embeddings: `@xenova/transformers`
-- Generation: `@google/genai` (Gemini)
-- Tests: Node test runner, `supertest`, `pdfkit`, `docx`
+## 🛠️ Installation & Setup
 
-## Setup
-1. Install dependencies:
-```bash
-npm install
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/your-username/document-analyzer-rag.git
+   cd document-analyzer-rag
+   ```
+
+2. **Install local dependencies:**
+   ```bash
+   npm install
+   ```
+
+3. **Configure the Environment:**
+   Copy the example config and inject your Gemini and SMTP keys.
+   ```bash
+   cp .env.example .env
+   ```
+   > **Note:** The backend *will* crash on boot if `GEMINI_API_KEY` is not explicitly set in `.env`.
+
+4. **Initialize Database Migrations:**
+   ```bash
+   npm run migrate
+   ```
+
+5. **Start the Development Server:**
+   ```bash
+   npm run dev
+   ```
+
+---
+
+## ⚙️ Environment Setup (`.env`)
+
+The project ships with an aggressively documented `.env.example` file. Key architectural variables include:
+
+### Server & AI
+- `GEMINI_API_KEY`: Highly required. Without this, RAG streaming faults globally.
+- `PORT` / `HOST`: Standard binding configs.
+- `LOCAL_EMBEDDING_BATCH_SIZE`: Tunes the native Xenova chunking matrix. Decrease from `24` if your RAM is limited.
+
+### Tuning the Indexer
+- `RAG_CHUNK_TOKENS` (Default 1000): Determines document slice density.
+- `RAG_CHUNK_OVERLAP_TOKENS`: Mitigates semantic meaning dropping at page fractures.
+
+### Worker & Housekeeping
+- `CLEANUP_INTERVAL_MS`: Defaults to 15 minutes to run full DB garbage collection loops.
+
+---
+
+## 🚀 Running Locally
+
+- **Production Sync Mode:**
+  ```bash
+  npm run start
+  ```
+- **Live-Reload Dev Mode:**
+  ```bash
+  npm run dev
+  ```
+- **Remote Cloudflare Tunneling:**
+  Using the bundled DevTools, you can easily proxy your local `4000` port to the public web for remote frontend consumption.
+  ```bash
+  # Boots tunnel, automatically intercepts public trycloudflare URL, and pushes configuration tracking to Github
+  AUTO_PUSH_TUNNEL_URL=true bash devtools/tunnel/start-tunnel.sh
+  ```
+  *(See `dev-runtime/backend-url.json` for live dynamic frontend mapping).*
+
+---
+
+## 📖 API Reference (Core Routes)
+
+All routes are prefixed under `/api/v1`. Route-level JWT auth (`Authorization: Bearer <token>`) is required generically post-login.
+
+### Authentication
+- `POST /auth/register` - Registers and transmits 6-digit verification OTP.
+- `POST /auth/verify-otp` - Activates the email address.
+- `POST /auth/login` - Resolves identity and initializes cross-device JWT session.
+- `POST /auth/refresh` - Mints new scoped access token manually without re-auth.
+- `POST /auth/request-reset` / `POST /auth/reset-password` - Unified OTP recovery flow.
+
+### Chat & Sessions
+- `POST /sessions` - Initializes a new semantic chat hierarchy.
+- `GET /sessions/:sessionId` - Dumps current metadata, including uploaded indexing artifacts.
+- `POST /sessions/:sessionId/chat` - Generates LLM response based on semantic vector matching.
+  - Supports `stream=true` queries to resolve HTTP Event Stream pipelines.
+- `GET /sessions/:sessionId/history` - Restores historical contexts with cursor pagination limits.
+
+### Documents & Ingestion
+- `POST /sessions/:sessionId/pdfs` - Streams `multipart/form-data` payloads to disk, instantiates a background `jobQueue` vector indexing worker immediately, and returns a job telemetry ID.
+- `GET /jobs/:jobId` - Polling endpoint for client UX loaders tracking the ingestion worker progress percentages and error blocks.
+
+---
+
+## 🛡️ Security Design
+
+1. **Hybrid Identity Matrix:** Active tracking ties user sessions heavily to generic device and IP fingerprints, ensuring proactive manual session invalidations operate strictly.
+2. **CORS Hardening:** Standard endpoints bind generic localhost configs but block dynamic or wildcards out-of-the-box (`process.env.CORS_ALLOWED_ORIGINS`).
+3. **Payload Sanitization:** Route limits enforce aggressive global payload ceilings (2MB standard, Multer overriding explicitly to 50MB purely parsing streams).
+4. **Data Isolation:** All session artifacts, PDF buffers, user meta, and native SQLite nodes map safely locally. No cloud external vector datastores exist.
+
+---
+
+## 🧬 Development Workflow
+
+- Run entire test suite: `npm run test`
+- Run integration isolated pipeline: `npm run test:integration`
+
+We strongly adhere to standard `commitlint` (e.g., `feat(auth):`, `fix(rag):`, `chore(tunnel):`) for commit history layout to support fluid changelog generations.
+
+---
+
+## 📁 Folder Structure
+
 ```
-
-2. Create environment file:
-```bash
-cp .env.example .env
-```
-
-3. Set required environment values (at minimum `GEMINI_API_KEY`).
-
-4. Run migrations:
-```bash
-npm run migrate
-```
-
-5. Start server:
-```bash
-npm run dev
-```
-
-## Environment Variables
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `4000` | HTTP port |
-| `HOST` | `0.0.0.0` | Bind address |
-| `NODE_ENV` | `development` | Runtime mode |
-| `TRUST_PROXY` | `false` | Express proxy trust |
-| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Allowed origins |
-| `GEMINI_API_KEY` | - | Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Comma-separated model candidates |
-| `DEFAULT_ADMIN_NAME` | `Default Admin` | Migration bootstrap user name |
-| `DEFAULT_ADMIN_EMAIL` | `admin@local` | Migration bootstrap user email |
-| `DEFAULT_ADMIN_PASSWORD` | generated if unset/invalid | Migration bootstrap user password |
-| `MAX_UPLOAD_FILE_SIZE_BYTES` | `52428800` | Upload max size |
-| `AUTH_LOGIN_WINDOW_MS` | `900000` | Login failure rolling window |
-| `AUTH_LOGIN_LOCK_MS` | `900000` | Lock duration after max failures |
-| `AUTH_LOGIN_MAX_FAILURES` | `6` | Failures before lock |
-| `RAG_TOP_K` | `5` | Retrieval top-k |
-| `RAG_CANDIDATE_PAGE_SIZE` | `400` | Similarity scan page size |
-| `RAG_HISTORY_LIMIT` | `12` | Prompt history cap |
-| `RAG_TOKEN_TO_CHAR_RATIO` | `4` | Chunking ratio |
-| `RAG_CHUNK_TOKENS` | `1000` | Chunk target tokens |
-| `RAG_CHUNK_OVERLAP_TOKENS` | `200` | Chunk overlap tokens |
-| `LOCAL_EMBEDDING_BATCH_SIZE` | `24` | Embedding batch size |
-| `LOCAL_EMBEDDING_BATCH_SIZE_MIN` | `8` | Min adaptive batch |
-| `LOCAL_EMBEDDING_BATCH_SIZE_MAX` | `64` | Max adaptive batch |
-| `CLEANUP_INTERVAL_MS` | `900000` | Cleanup interval |
-| `CLEANUP_COMPLETED_JOB_TTL_HOURS` | `24` | Completed job retention |
-| `CLEANUP_FAILED_JOB_TTL_HOURS` | `72` | Failed job retention |
-| `CLEANUP_TEMP_FILE_TTL_HOURS` | `6` | Temp upload retention |
-
-## Project Structure
-```text
-.
-├── docs/
-├── scripts/
+├── .env.example                # Base configurations tracking parameters
+├── data/                       # Local volume storing db.sqlite buffers
+├── dev-runtime/                # Autogenerated frontend bindings for tunnel URLs
+├── devtools/tunnel/            # Bash orchestration for cloudflared exposure
+├── scripts/                    # Schema migrations and bootstrapping
 ├── src/
-│   ├── app.js
-│   ├── server.js
-│   ├── db/
-│   ├── middleware/
-│   ├── parsers/
-│   ├── routes/
-│   ├── services/
-│   └── utils/
-├── tests/
-├── .env.example
-├── openapi.yaml
-├── package.json
-└── README.md
+│   ├── app.js                  # Express pipeline & global middleware
+│   ├── db/                     # SQLite drivers and blob abstraction models
+│   ├── middleware/             # Rate Limiter definitions and generic logic validators
+│   ├── routes/                 # Explicit Express router interfaces
+│   ├── services/               # Complex logic containing Vector Stores, LLM bridges etc.
+│   └── utils/                  # Zod schema definitions and native logger outputs
+└── tests/                      # Extensive Node.js native (`node:test`) assertions
 ```
 
-## Development
-Run app:
-```bash
-npm run dev
-```
+---
 
-Run all tests:
-```bash
-npm test
-```
+## 🔍 Troubleshooting
 
-Run migration dry-run:
-```bash
-npm run migrate:dry-run
-```
+- **`SQLITE_ERROR: no such table`**: Ensure you have successfully seeded your local file map with `npm run migrate`.
+- **`GPU Out Of Memory / Worker Hang`**: Xenova's default `LOCAL_EMBEDDING_BATCH_SIZE=24` may crush lightweight containers (specifically those under 1GB RAM limits). Drop safely to `8` in `.env`.
+- **`Error: Invalid JSON body`**: Validate that requests routing PDF files use strict `multipart/form-data` instead of native Express generic parsing logic.
+- **`SSE Chunk Failing`**: In a public hosting environment proxying across NGINX, `proxy_buffering off` must be configured for the backend mapping explicitly, otherwise chunks pool up locally returning generically chunked answers.
 
-## Notes
-- Session deletion is hardened to remove DB records (sessions, PDFs, chunks, chat, related jobs) and uploaded files on disk.
-- Route-level rate limiting and schema validation are enabled.
-- Admin endpoints are blocked when `NODE_ENV=production`.
+---
 
-## License
-ISC
+## 🚀 Future Improvements
+
+- Map semantic routing capabilities utilizing more extensive external vector-db drivers for multi-tenant high availability.
+- Allow generic HTML/DOCX ingestion dynamically parallel utilizing integrated mammoth loaders.
+- Improve system telemetry outputs bridging with Grafana/Prometheus metric scrapes natively.

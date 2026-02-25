@@ -61,9 +61,9 @@ while true; do
     
     # Wait for the tunnel connection to stabilize and print the URL
     URL=""
-    for i in {1..15}; do
+    for i in {1..30}; do
         sleep 1
-        URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' "$LOG_FILE" | tail -1)
+        URL=$(grep -a -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' "$LOG_FILE" | tail -1)
         if [ -n "$URL" ]; then
             break
         fi
@@ -112,7 +112,7 @@ fs.writeFileSync('$RUNTIME_FILE', JSON.stringify({
                     cd "$RUNTIME_DIR" || exit
                     git add backend-url.json
                     git commit -m "chore: update tunnel runtime url"
-                    git push
+                    git push origin HEAD
                 ) > /dev/null 2>&1 || echo -e "${YELLOW}[WARNING] Runtime config push ignored (git not ready or push failed).${NC}" | tee -a "$LOG_FILE"
             fi
         fi

@@ -85,9 +85,9 @@ async function sendEmail(type, data) {
     case 'reset':
       subject = 'Password Reset Request';
       html = renderEmailTemplate('Password Reset', `
-                <p>We received a request to reset your password. Use the secure token below to confirm the reset:</p>
-                <div class="code-block" style="font-size: 16px; letter-spacing: normal; word-break: break-all;">${data.token}</div>
-                <p>This token is valid for 15 minutes. If you did not request a password reset, you can safely ignore this email.</p>
+                <p>We received a request to reset your password. Enter this 6-digit code to reset your password:</p>
+                <div class="code-block" style="font-size: 24px; letter-spacing: 4px; word-break: break-all;">${data.otp}</div>
+                <p>This code is valid for 15 minutes. If you did not request a password reset, you can safely ignore this email.</p>
             `);
       break;
     case 'reset-success':

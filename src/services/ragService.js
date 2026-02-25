@@ -520,9 +520,35 @@ function shouldRunAsyncChat({ sessionId, history = [] }) {
   return chunkCount > 1200 || history.length > 20;
 }
 
+async function generateSessionTitle(message, firstPdfTitle = null) {
+  const prompt = `Generate a short, human-readable title (4 to 6 words, max 60 characters) for a chat session based on this first message: "${message}". ${firstPdfTitle ? `The primary document is called "${firstPdfTitle}". ` : ''}Reply with ONLY the title itself, no quotes, no markdown, no other text.`;
+
+  try {
+    const ai = getGenAI();
+    const model = getGenerationModelCandidates()[0];
+    const response = await ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: { temperature: 0.7 }
+    });
+
+    let title = String(response?.text || '').trim();
+    // Strip possible quotes the LLM might still stubbornly add
+    title = title.replace(/^["']|["']$/g, '');
+    if (title.length > 60) {
+      title = title.substring(0, 57) + '...';
+    }
+    return title;
+  } catch (err) {
+    logError('ERROR_TITLE_GEN', err, { service: 'ragService' });
+    return null;
+  }
+}
+
 module.exports = {
   normalizeResponseStyle,
   runChatQuery,
   runChatQueryStream,
   shouldRunAsyncChat,
+  generateSessionTitle,
 };

@@ -56,6 +56,7 @@ const {
   runChatQueryStream,
   shouldRunAsyncChat,
   normalizeResponseStyle,
+  generateSessionTitle,
 } = require('../services/ragService');
 const { addConversation, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
 const { getMetrics, recordQuery } = require('../services/metricsService');
@@ -120,7 +121,8 @@ const requestResetBodySchema = z.object({
 });
 
 const resetPasswordBodySchema = z.object({
-  token: z.string().min(1),
+  email: z.string().email().max(320),
+  otp: z.string().min(6).max(6),
   newPassword: z.string().min(8).max(128),
 });
 
@@ -332,7 +334,7 @@ router.post('/auth/request-reset', registerLimiter, validateSchema(requestResetB
 }));
 
 router.post('/auth/reset-password', registerLimiter, validateSchema(resetPasswordBodySchema), asyncHandler(async (req, res) => {
-  await executePasswordReset(req.body.token, req.body.newPassword);
+  await executePasswordReset(req.body.email, req.body.otp, req.body.newPassword);
   return ok(res, { message: 'Password reset successfully. Please log in with your new password.' });
 }));
 
@@ -669,6 +671,22 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
         }
       }
 
+      let finalSessionTitle = session.title;
+      if (session.title === 'NewChat') {
+        try {
+          // Fire title generation non-blocking using Gemini
+          const pdfs = listPdfsBySession(sessionId, req.user.id);
+          const firstPdfTitle = pdfs && pdfs.length > 0 ? pdfs[0].title : null;
+          const newTitle = await generateSessionTitle(message, firstPdfTitle);
+          if (newTitle) {
+            renameSession(sessionId, req.user.id, newTitle);
+            finalSessionTitle = newTitle;
+          }
+        } catch (titleError) {
+          logError('ERROR_TITLE_GEN_STREAM', titleError, { sessionId });
+        }
+      }
+
       emitEvent('done', {
         ok: true,
         data: {
@@ -678,7 +696,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
           responseStyle: response.responseStyle,
           sources: response.sources,
           usedChunksCount: response.usedChunksCount,
-          sessionTitle: session.title,
+          sessionTitle: finalSessionTitle,
         },
       });
     } catch (error) {
@@ -740,6 +758,21 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
     });
   }
 
+  let finalSessionTitle = session.title;
+  if (session.title === 'NewChat') {
+    try {
+      const pdfs = listPdfsBySession(sessionId, req.user.id);
+      const firstPdfTitle = pdfs && pdfs.length > 0 ? pdfs[0].title : null;
+      const newTitle = await generateSessionTitle(message, firstPdfTitle);
+      if (newTitle) {
+        renameSession(sessionId, req.user.id, newTitle);
+        finalSessionTitle = newTitle;
+      }
+    } catch (titleError) {
+      logError('ERROR_TITLE_GEN_SYNC', titleError, { sessionId });
+    }
+  }
+
   return ok(res, {
     answer: response.answer,
     formattedAnswer: response.formattedAnswer,
@@ -747,7 +780,7 @@ router.post('/sessions/:sessionId/chat', chatLimiter, validateSchema(chatBodySch
     responseStyle: response.responseStyle,
     sources: response.sources,
     usedChunksCount: response.usedChunksCount,
-    sessionTitle: session.title,
+    sessionTitle: finalSessionTitle,
   });
 }));
 

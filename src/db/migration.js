@@ -124,6 +124,7 @@ function ensureNewTables(db, actions) {
         created_at TEXT NOT NULL,
         device_info TEXT,
         ip_address TEXT,
+        last_used_at TEXT,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
       );`,
     },
@@ -142,6 +143,53 @@ function ensureNewTables(db, actions) {
         error TEXT,
         createdAt TEXT NOT NULL,
         updatedAt TEXT NOT NULL
+      );`,
+    },
+    {
+      description: 'Create refresh_tokens table',
+      sql: `CREATE TABLE IF NOT EXISTS refresh_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );`,
+    },
+    {
+      description: 'Create email_otps table',
+      sql: `CREATE TABLE IF NOT EXISTS email_otps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        otp_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        type TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );`,
+    },
+    {
+      description: 'Create password_reset_otps table',
+      sql: `CREATE TABLE IF NOT EXISTS password_reset_otps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        otp_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        used INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );`,
+    },
+    {
+      description: 'Create login_attempts table',
+      sql: `CREATE TABLE IF NOT EXISTS login_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        ip_address TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        locked_until INTEGER NOT NULL DEFAULT 0,
+        window_start INTEGER NOT NULL
       );`,
     },
     {
@@ -204,6 +252,22 @@ function ensureNewTables(db, actions) {
       description: 'Create auth_sessions expires_at index',
       sql: 'CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at ON auth_sessions(expires_at);',
     },
+    {
+      description: 'Create refresh_tokens token_hash index',
+      sql: 'CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_tokens_token_hash ON refresh_tokens(token_hash);',
+    },
+    {
+      description: 'Create refresh_tokens user_id index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);',
+    },
+    {
+      description: 'Create email_otps email index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_email_otps_email ON email_otps(email);',
+    },
+    {
+      description: 'Create login_attempts email_ip index',
+      sql: 'CREATE INDEX IF NOT EXISTS idx_login_attempts_email_ip ON login_attempts(email, ip_address);',
+    },
   ];
 
   for (const statement of statements) {
@@ -260,6 +324,18 @@ function ensureOwnershipColumns(db, actions) {
     const scopedSql = 'CREATE INDEX IF NOT EXISTS idx_chat_messages_user_id_sessionId ON chat_messages(user_id, sessionId);';
     logAction(actions, scopedSql, 'Create chat_messages user_id + sessionId index');
     db.exec(scopedSql);
+  }
+
+  if (!columnExists(db, 'users', 'is_active')) {
+    const sql = 'ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;';
+    logAction(actions, sql, 'Add users.is_active column (defaults to 1 for backwards compatibility)');
+    db.exec(sql);
+  }
+
+  if (!columnExists(db, 'auth_sessions', 'last_used_at')) {
+    const sql = 'ALTER TABLE auth_sessions ADD COLUMN last_used_at TEXT;';
+    logAction(actions, sql, 'Add auth_sessions.last_used_at column');
+    db.exec(sql);
   }
 }
 

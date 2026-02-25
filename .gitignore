@@ -31,3 +31,6 @@ pnpm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Tunnel logs
+devtools/tunnel/logs

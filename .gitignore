@@ -34,3 +34,7 @@ Thumbs.db
 
 # Tunnel logs
 devtools/tunnel/logs
+
+# Tunnel Runtimes
+dev-runtime/
+cloudflared-*

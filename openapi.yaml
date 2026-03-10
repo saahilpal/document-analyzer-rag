@@ -91,6 +91,8 @@ components:
       properties:
         answer:
           type: string
+        message:
+          type: string
         formattedAnswer:
           type: string
         responseSchema:
@@ -229,7 +231,10 @@ paths:
           description: Deleted
   /api/v1/sessions/{sessionId}/chat:
     post:
-      summary: Run chat query against indexed session documents
+      summary: Run chat query against indexed session documents. 
+      description: |
+        If no documents exist for the session, the backend immediately returns a helpful assistant message instructing the user to upload a file (HTTP 200) instead of throwing a PDF_NOT_READY error.
+        Session title is generated automatically on the 2nd message, and may be refined automatically from the 6th message onwards.
       parameters:
         - in: path
           name: sessionId

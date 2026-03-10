@@ -7,7 +7,7 @@ const {
     normalizeResponseStyle,
     generateSessionTitle,
 } = require('../services/ragService');
-const { addMessage, listSessionHistory, clearSessionHistory } = require('../services/chatHistoryService');
+const { addMessage, listSessionHistory, clearSessionHistory, getSessionMessageCount } = require('../services/chatHistoryService');
 const { recordQuery } = require('../services/metricsService');
 const { addJob, getQueuePosition } = require('../services/jobQueue');
 const { parsePositiveInt, validateHistory } = require('../utils/helpers');
@@ -44,7 +44,18 @@ async function postChat(req, res) {
 
     const normalizedHistory = validateHistory(history);
     const readiness = getPdfReadinessBySession(sessionId, req.user.id);
-    if (readiness.uploaded === 0 || readiness.indexed === 0 || readiness.processing > 0 || readiness.failed > 0) {
+
+    if (readiness.uploaded === 0) {
+        return res.json({
+            ok: true,
+            data: {
+                answer: "Please upload a document first so I can analyze it.\nSupported formats: PDF, DOCX, CSV, MD, TXT.",
+                message: "Please upload a document first so I can analyze it.\nSupported formats: PDF, DOCX, CSV, MD, TXT."
+            }
+        });
+    }
+
+    if (readiness.indexed === 0 || readiness.processing > 0 || readiness.failed > 0) {
         return fail(
             res,
             createHttpError(400, 'PDF_NOT_READY', 'Documents still processing or failed indexing.', {
@@ -141,19 +152,30 @@ async function postChat(req, res) {
             }
 
             let finalSessionTitle = session.title;
-            if (session.title === 'NewChat') {
+            const messageCount = getSessionMessageCount(sessionId, req.user.id);
+            const needsInitialTitle = session.title === 'NewChat' && messageCount >= 2;
+            const needsTitleRefinement = session.title !== 'NewChat' && messageCount >= 6;
+
+            if (needsInitialTitle || needsTitleRefinement) {
                 await withSessionLock(sessionId, async () => {
                     try {
                         // Re-fetch session to ensure it wasn't renamed while we waited
                         const currentSession = assertSessionExists(sessionId, req.user.id);
-                        if (currentSession.title !== 'NewChat') {
+                        if (needsInitialTitle && currentSession.title !== 'NewChat') {
                             finalSessionTitle = currentSession.title;
                             return;
                         }
 
                         const pdfs = listPdfsBySession(sessionId, req.user.id);
                         const firstPdfTitle = pdfs && pdfs.length > 0 ? pdfs[0].title : null;
-                        const newTitle = await generateSessionTitle(message, firstPdfTitle);
+
+                        // Extract context (last few user messages) for title generation
+                        const recentHistory = listSessionHistory(sessionId, req.user.id, { limit: 5 })
+                            .filter(msg => msg.role === 'user')
+                            .map(msg => msg.text)
+                            .join(' | ');
+
+                        const newTitle = await generateSessionTitle(recentHistory || message, firstPdfTitle);
                         if (newTitle) {
                             renameSession(sessionId, req.user.id, newTitle);
                             finalSessionTitle = newTitle;
@@ -237,18 +259,28 @@ async function postChat(req, res) {
     }
 
     let finalSessionTitle = session.title;
-    if (session.title === 'NewChat') {
+    const messageCount = getSessionMessageCount(sessionId, req.user.id);
+    const needsInitialTitle = session.title === 'NewChat' && messageCount >= 2;
+    const needsTitleRefinement = session.title !== 'NewChat' && messageCount >= 6;
+
+    if (needsInitialTitle || needsTitleRefinement) {
         await withSessionLock(sessionId, async () => {
             try {
                 const currentSession = assertSessionExists(sessionId, req.user.id);
-                if (currentSession.title !== 'NewChat') {
+                if (needsInitialTitle && currentSession.title !== 'NewChat') {
                     finalSessionTitle = currentSession.title;
                     return;
                 }
 
                 const pdfs = listPdfsBySession(sessionId, req.user.id);
                 const firstPdfTitle = pdfs && pdfs.length > 0 ? pdfs[0].title : null;
-                const newTitle = await generateSessionTitle(message, firstPdfTitle);
+
+                const recentHistory = listSessionHistory(sessionId, req.user.id, { limit: 5 })
+                    .filter(msg => msg.role === 'user')
+                    .map(msg => msg.text)
+                    .join(' | ');
+
+                const newTitle = await generateSessionTitle(recentHistory || message, firstPdfTitle);
                 if (newTitle) {
                     renameSession(sessionId, req.user.id, newTitle);
                     finalSessionTitle = newTitle;

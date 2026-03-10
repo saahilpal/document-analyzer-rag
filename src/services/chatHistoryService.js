@@ -26,6 +26,12 @@ const listMessagesStmt = db.prepare(`
   OFFSET @offset
 `);
 
+const countUserMessagesStmt = db.prepare(`
+  SELECT COUNT(*) AS count
+  FROM chat_messages
+  WHERE sessionId = ? AND user_id = ? AND role = 'user'
+`);
+
 const deleteMessagesStmt = db.prepare(`
   DELETE FROM chat_messages
   WHERE sessionId = ? AND user_id = ?
@@ -173,9 +179,16 @@ function clearSessionHistory(sessionId, userId) {
   return { cleared: true };
 }
 
+function getSessionMessageCount(sessionId, userId) {
+  const normalizedUserId = normalizeUserId(userId);
+  const result = countUserMessagesStmt.get(sessionId, normalizedUserId);
+  return result ? result.count : 0;
+}
+
 module.exports = {
   addMessage,
   addConversation,
   listSessionHistory,
   clearSessionHistory,
+  getSessionMessageCount,
 };

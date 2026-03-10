@@ -34,7 +34,9 @@
 
 - Prompt includes selected context and recent history.
 - Gemini is called only for generation.
-- If generation fails or no context exists, deterministic fallback answer is returned.
+- If generation fails, a deterministic error answer is returned.
+- If retrieval yields no context chunks but documents exist, Gemini falls back to answering general English questions using its own knowledge.
+- If no documents exist in the session, the backend immediately returns a helpful auto-assistant message instructing the user to upload a document (`pdf`, `docx`, `csv`, `md`, `txt`) instead of attempting AI generation.
 
 ## Streaming
 
@@ -42,4 +44,6 @@ For SSE chat:
 - emits `ready`
 - emits periodic `progress`
 - emits incremental `token`
-- emits final `done` or `error`
+- emits final `done` (contains standard answer schema and `sessionTitle`) or `error`
+
+> **Note**: For both streaming and synchronous modes, the `sessionTitle` is only generated after the 2nd user message in a new chat. It may be refined automatically from the 6th message onward.

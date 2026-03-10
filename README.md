@@ -41,7 +41,13 @@ Detailed docs:
 5. Vectors are stored in SQLite `chunks` table.
 6. Chat request retrieves bounded top candidates by cosine similarity.
 7. Prompt is built from context + history and sent to Gemini.
+   - If no context chunks are found, Gemini may fall back to answering general knowledge questions.
 8. Response is returned sync/async, with SSE streaming support.
+
+> If the session has no documents, the chat endpoint short-circuits and gracefully returns a normal assistant message asking for an upload. It won't throw PDF_NOT_READY errors.
+
+> **Session Titles**: The conversation title is not generated immediately. Title generation triggers on message 2, and may automatically refine continuously for long conversations (≥ 6 messages).
+
 
 ## Installation
 

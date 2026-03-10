@@ -52,7 +52,7 @@ const env = Object.freeze({
   maxExtractedTextLength: toNumber(process.env.MAX_EXTRACTED_TEXT_LENGTH, 2_000_000, { min: 1000 }),
 
   // RAG and embeddings
-  ragTopK: toNumber(process.env.RAG_TOP_K, 5, { min: 1 }),
+  ragTopK: toNumber(process.env.RAG_TOP_K, 8, { min: 1 }),
   ragCandidatePageSize: toNumber(process.env.RAG_CANDIDATE_PAGE_SIZE, 400, { min: 10 }),
   ragHistoryLimit: toNumber(process.env.RAG_HISTORY_LIMIT, 12, { min: 1 }),
   ragResponseStyle: String(process.env.RAG_RESPONSE_STYLE || 'structured').trim().toLowerCase(),
@@ -69,7 +69,7 @@ const env = Object.freeze({
   authLoginMaxFailures: toNumber(process.env.AUTH_LOGIN_MAX_FAILURES, 6, { min: 1 }),
   jwtSecret: String(
     process.env.JWT_SECRET
-      || 'fallback-secret-for-dev-only-do-not-use-in-prod-12345'
+    || 'fallback-secret-for-dev-only-do-not-use-in-prod-12345'
   ).trim(),
 
   // Cleanup

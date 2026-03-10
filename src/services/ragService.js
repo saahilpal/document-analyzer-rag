@@ -34,8 +34,8 @@ function normalizeResponseStyle(value) {
 function formatHistory(history = []) {
   return history
     .slice(-DEFAULT_HISTORY_LIMIT)
-    .map((entry) => `${entry.role}: ${entry.text}`)
-    .join('\n');
+    .map((entry) => `${entry.role.toUpperCase()}: ${entry.text}`)
+    .join('\n\n');
 }
 
 function buildPrompt({ message, history, candidates, responseStyle }) {
@@ -44,10 +44,24 @@ function buildPrompt({ message, history, candidates, responseStyle }) {
     .join('\n\n');
 
   const structuredInstructions = normalizeResponseStyle(responseStyle) === 'structured'
-    ? '\n\nResponse format (strict plain text):\nAnswer: <direct answer in 1-3 sentences>\n\nKey Points:\n- <point>\n- <point>\n\nEvidence:\n- Chunk <n>: <short evidence>\n\nFollow-up:\n- <next question>\n\nRules:\n- Use plain text only.\n- Do not use markdown markers like **, __, #, or backticks.\n- Keep one blank line between sections.\n- If answer is not in context, set Answer to: I don\'t know - please provide more context.'
+    ? '\n\nResponse format (strict plain text):\nAnswer: <direct answer in 1-3 sentences>\n\nKey Points:\n- <point>\n- <point>\n\nEvidence:\n- Chunk <n>: <short evidence, or None>\n\nFollow-up:\n- <next question>\n\nRules:\n- Use plain text only.\n- Do not use markdown markers like **, __, #, or backticks.\n- Keep one blank line between sections.'
     : '';
 
-  return `You are a PDF analysis assistant.\nUse ONLY the provided context chunks and chat history.\nIf the answer is not found in context, reply exactly: I don't know - please provide more context.${structuredInstructions}\n\nRecent chat history:\n${formatHistory(history)}\n\nUser message:\n${message}\n\nContext:\n${context}`;
+  return `SYSTEM:
+You are an AI assistant that analyzes uploaded documents.
+When documents exist:
+Use them as primary context.
+If the question asks about general English meaning, definitions, or explanations, you may answer normally.
+Always try to help the user understand the content clearly.${structuredInstructions}
+
+CHAT HISTORY:
+${formatHistory(history) || 'No prior history.'}
+
+DOCUMENT CONTEXT:
+${context || 'No documents retrieved.'}
+
+USER QUESTION:
+${message}`;
 }
 
 function buildStructuredFallbackAnswer() {
@@ -370,7 +384,7 @@ async function retrieveCandidates({ sessionId, message, topK, onProgress }) {
   }
 
   const queryEmbedding = await generateEmbedding(message);
-  const normalizedTopK = Math.max(1, Math.min(5, Number(topK) || DEFAULT_TOP_K));
+  const normalizedTopK = Math.max(1, Math.min(8, Number(topK) || DEFAULT_TOP_K));
   const candidates = await similaritySearch({
     sessionId,
     queryEmbedding,
@@ -404,17 +418,6 @@ async function runChatQuery(
     topK,
     onProgress,
   });
-
-  if (candidates.length === 0) {
-    if (onProgress) {
-      onProgress({ stage: 'generating', progress: 100 });
-    }
-    return {
-      ...normalizeAnswerPayload({ rawText: '', responseStyle: normalizedResponseStyle }),
-      sources: [],
-      usedChunksCount: 0,
-    };
-  }
 
   const prompt = buildPrompt({
     message,
@@ -466,24 +469,6 @@ async function runChatQueryStream(
     onProgress,
   });
 
-  if (candidates.length === 0) {
-    const fallback = normalizeAnswerPayload({
-      rawText: '',
-      responseStyle: normalizedResponseStyle,
-    });
-    if (onProgress) {
-      onProgress({ stage: 'generating', progress: 100 });
-    }
-    if (onToken) {
-      onToken(fallback.formattedAnswer);
-    }
-    return {
-      ...fallback,
-      sources: [],
-      usedChunksCount: 0,
-    };
-  }
-
   const prompt = buildPrompt({
     message,
     history,
@@ -522,7 +507,9 @@ function shouldRunAsyncChat({ sessionId, history = [] }) {
 }
 
 async function generateSessionTitle(message, firstPdfTitle = null) {
-  const prompt = `Generate a short, human-readable title (4 to 6 words, max 60 characters) for a chat session based on this first message: "${message}". ${firstPdfTitle ? `The primary document is called "${firstPdfTitle}". ` : ''}Reply with ONLY the title itself, no quotes, no markdown, no other text.`;
+  const prompt = `Generate a short conversation title (max 5 words) based on the user's questions. ${firstPdfTitle ? `The primary document is called "${firstPdfTitle}". ` : ''}Do not use punctuation.
+  
+User questions: "${message}"`;
 
   try {
     const ai = getGenAI();

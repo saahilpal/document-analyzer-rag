@@ -20,8 +20,7 @@ async function createAuthContext(app, options = {}) {
 
   const otp = registerResponse.body.data?.otp;
   if (!otp) {
-    console.error('Registration Response:', JSON.stringify(registerResponse.body, null, 2));
-    throw new Error('No OTP returned from register in test environment');
+    throw new Error(`No OTP returned from register in test environment: ${JSON.stringify(registerResponse.body)}`);
   }
 
   const verifyResponse = await request(app)

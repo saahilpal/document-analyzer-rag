@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const request = require('supertest');
 const app = require('../src/app');
 const { createAuthContext, buildSamplePdfBuffer, waitForPdfStatus } = require('./helpers');
+const aiTest = process.env.SKIP_AI_TESTS === 'true' ? test.skip : test;
 
-test('chat-first integration flow', async () => {
+aiTest('chat-first integration flow', async () => {
   const auth = await createAuthContext(app);
 
   const createSession = await request(app)

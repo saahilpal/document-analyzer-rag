@@ -3,8 +3,9 @@ const assert = require('node:assert/strict');
 const request = require('supertest');
 const app = require('../src/app');
 const { createAuthContext, buildSamplePdfBuffer, waitForPdfStatus } = require('./helpers');
+const aiTest = process.env.SKIP_AI_TESTS === 'true' ? test.skip : test;
 
-test('chat streaming emits SSE tokens and persists conversation on completion', async () => {
+aiTest('chat streaming emits SSE tokens and persists conversation on completion', async () => {
   const auth = await createAuthContext(app);
 
   const session = await request(app)

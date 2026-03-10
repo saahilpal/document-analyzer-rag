@@ -5,8 +5,9 @@ const app = require('../src/app');
 const db = require('../src/config/database');
 const { runMigrations } = require('../src/database/migrations');
 const { createAuthContext, buildSamplePdfBuffer } = require('./helpers');
+const describeStress = process.env.SKIP_AI_TESTS === 'true' ? describe.skip : describe;
 
-describe('Load Safety and Stress Tests', () => {
+describeStress('Load Safety and Stress Tests', () => {
     let server;
     before(async () => {
         runMigrations();

@@ -1,9 +1,10 @@
 const app = require('./app');
 const { startCleanupWorker } = require('./services/cleanupService');
-const { logError, logInfo } = require('./utils/logger');
+const { logError, logInfo } = require('./config/logger');
+const env = require('./config/env');
 
-const port = Number(process.env.PORT) || 4000;
-const host = process.env.HOST || '0.0.0.0';
+const port = env.port;
+const host = env.host;
 
 process.on('unhandledRejection', (reason) => {
   logError('ERROR_QUEUE', reason instanceof Error ? reason : new Error(String(reason)), {

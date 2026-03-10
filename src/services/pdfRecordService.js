@@ -1,5 +1,5 @@
 const path = require('path');
-const db = require('../db/database');
+const db = require('../config/database');
 const { invalidatePdfCache } = require('./vectorService');
 
 const insertPdfStmt = db.prepare(`

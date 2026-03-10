@@ -2,12 +2,13 @@ const { cleanupJobs } = require('./jobQueue');
 const { cleanupTempUploadsOlderThan } = require('./uploadService');
 const { cleanupOrphanChunks } = require('./vectorService');
 const { cleanupExpiredAuthSessions } = require('./authService');
-const { logInfo, logError } = require('../utils/logger');
+const { logInfo, logError } = require('../config/logger');
+const env = require('../config/env');
 
-const DEFAULT_CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS) || 15 * 60 * 1000;
-const DEFAULT_COMPLETED_JOB_TTL_HOURS = Number(process.env.CLEANUP_COMPLETED_JOB_TTL_HOURS) || 24;
-const DEFAULT_FAILED_JOB_TTL_HOURS = Number(process.env.CLEANUP_FAILED_JOB_TTL_HOURS) || 72;
-const DEFAULT_TEMP_FILE_TTL_HOURS = Number(process.env.CLEANUP_TEMP_FILE_TTL_HOURS) || 6;
+const DEFAULT_CLEANUP_INTERVAL_MS = env.cleanupIntervalMs;
+const DEFAULT_COMPLETED_JOB_TTL_HOURS = env.cleanupCompletedJobTtlHours;
+const DEFAULT_FAILED_JOB_TTL_HOURS = env.cleanupFailedJobTtlHours;
+const DEFAULT_TEMP_FILE_TTL_HOURS = env.cleanupTempFileTtlHours;
 
 let cleanupTimer = null;
 let cleanupRunning = false;

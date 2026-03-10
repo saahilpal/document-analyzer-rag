@@ -1,4 +1,4 @@
-const db = require('../db/database');
+const db = require('../config/database');
 const ALLOWED_ROLES = new Set(['user', 'assistant', 'system']);
 
 const insertMessageStmt = db.prepare(`

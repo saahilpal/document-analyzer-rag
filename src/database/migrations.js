@@ -3,9 +3,10 @@ const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
+const env = require('../config/env');
 
-const dataDir = path.join(process.cwd(), 'data');
-const dbPath = path.join(dataDir, 'studyrag.sqlite');
+const dbPath = path.resolve(process.cwd(), env.dbPath);
+const dataDir = path.dirname(dbPath);
 
 function ensureDataDir() {
   try {

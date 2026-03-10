@@ -1,9 +1,9 @@
-const db = require('../db/database');
+const db = require('../config/database');
 const { indexPdfById } = require('./indexingService');
 const { runChatQuery } = require('./ragService');
 const { addConversation } = require('./chatHistoryService');
 const { recordIndexing, recordQuery } = require('./metricsService');
-const { logError } = require('../utils/logger');
+const { logError } = require('../config/logger');
 
 const queue = [];
 const jobs = new Map();

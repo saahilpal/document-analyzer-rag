@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const db = require('../src/db/database');
+const db = require('../src/config/database');
 const { createSession, deleteSession } = require('../src/services/sessionService');
 const { createPdfRecord } = require('../src/services/pdfRecordService');
 const { createUser } = require('../src/services/authService');

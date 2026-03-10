@@ -21,16 +21,16 @@ test('auth register/login/logout lifecycle', async () => {
 
   assert.equal(register.status, 200);
   assert.equal(register.body.ok, true);
-  assert.equal(typeof register.body.data.token, 'string');
-  assert.equal(typeof register.body.data.expiresAt, 'string');
-  assert.equal(register.body.data.user.email, userPayload.email.toLowerCase());
 
-  const protectedWithToken = await request(app)
-    .get('/api/v1/sessions')
-    .set('Authorization', `Bearer ${register.body.data.token}`);
+  // New step: Verify OTP
+  const verify = await request(app)
+    .post('/api/v1/auth/verify-otp')
+    .send({
+      email: userPayload.email,
+      otp: register.body.data.otp, // In dev, the OTP is returned in the response
+    });
 
-  assert.equal(protectedWithToken.status, 200);
-  assert.equal(protectedWithToken.body.ok, true);
+  assert.equal(verify.status, 200);
 
   const login = await request(app)
     .post('/api/v1/auth/login')
@@ -41,12 +41,11 @@ test('auth register/login/logout lifecycle', async () => {
 
   assert.equal(login.status, 200);
   assert.equal(login.body.ok, true);
-  assert.equal(typeof login.body.data.token, 'string');
-  assert.notEqual(login.body.data.token, register.body.data.token);
+  assert.equal(typeof login.body.data.accessToken, 'string');
 
   const logout = await request(app)
     .delete('/api/v1/auth/session')
-    .set('Authorization', `Bearer ${login.body.data.token}`);
+    .set('Authorization', `Bearer ${login.body.data.accessToken}`);
 
   assert.equal(logout.status, 200);
   assert.equal(logout.body.ok, true);
@@ -54,7 +53,7 @@ test('auth register/login/logout lifecycle', async () => {
 
   const afterLogout = await request(app)
     .get('/api/v1/sessions')
-    .set('Authorization', `Bearer ${login.body.data.token}`);
+    .set('Authorization', `Bearer ${login.body.data.accessToken}`);
 
   assert.equal(afterLogout.status, 401);
   assert.equal(afterLogout.body.ok, false);

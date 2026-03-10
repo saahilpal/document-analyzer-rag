@@ -1,23 +1,24 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('../db/database');
+const db = require('../config/database');
+const env = require('../config/env');
 const { createHttpError } = require('../utils/errors');
 const { sendEmail } = require('./emailService');
 
 const AUTH_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const OTP_TTL_MS = 5 * 60 * 1000;
-const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
+const RESET_OTP_TTL_MS = 15 * 60 * 1000;
 const AUTH_SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const BCRYPT_ROUNDS = 12;
 
-const LOGIN_WINDOW_MS = Number(process.env.AUTH_LOGIN_WINDOW_MS) || 15 * 60 * 1000;
-const LOGIN_LOCK_MS = Number(process.env.AUTH_LOGIN_LOCK_MS) || 15 * 60 * 1000;
-const LOGIN_MAX_FAILURES = Number(process.env.AUTH_LOGIN_MAX_FAILURES) || 6;
+const LOGIN_WINDOW_MS = env.authLoginWindowMs;
+const LOGIN_LOCK_MS = env.authLoginLockMs;
+const LOGIN_MAX_FAILURES = env.authLoginMaxFailures;
 
 const DUMMY_PASSWORD_HASH = bcrypt.hashSync('invalid-password-placeholder', BCRYPT_ROUNDS);
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-for-dev-only-do-not-use-in-prod-12345';
+const JWT_SECRET = env.jwtSecret;
 
 let lastSessionCleanupAt = 0;
 
@@ -39,12 +40,7 @@ const insertAuthSessionStmt = db.prepare(`
   VALUES (@id, @userId, @tokenHash, @expiresAt, @createdAt, @deviceInfo, @ipAddress, @lastUsedAt)
 `);
 
-const getAuthSessionByTokenHashStmt = db.prepare(`
-  SELECT s.id AS sessionId, s.user_id AS sessionUserId, s.expires_at AS expiresAt, u.id, u.name, u.email, u.password_hash AS passwordHash, u.created_at AS createdAt, u.updated_at AS updatedAt, u.is_active AS isActive FROM auth_sessions s INNER JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? LIMIT 1
-`);
-
 const deleteAuthSessionByIdStmt = db.prepare(`DELETE FROM auth_sessions WHERE id = ?`);
-const deleteAuthSessionByTokenHashStmt = db.prepare(`DELETE FROM auth_sessions WHERE token_hash = ?`);
 const deleteExpiredAuthSessionsStmt = db.prepare(`DELETE FROM auth_sessions WHERE expires_at <= ?`);
 
 const insertRefreshTokenStmt = db.prepare(`
@@ -70,16 +66,26 @@ const getOtpStmt = db.prepare(`
 const incrementOtpAttemptStmt = db.prepare(`UPDATE email_otps SET attempts = attempts + 1 WHERE id = ?`);
 const lockOtpStmt = db.prepare(`UPDATE email_otps SET attempts = 999 WHERE id = ?`);
 
-const insertPasswordResetStmt = db.prepare(`
-  INSERT INTO password_resets (user_id, token_hash, expires_at, created_at)
-  VALUES (@userId, @tokenHash, @expiresAt, @createdAt)
+const insertPasswordResetOtpStmt = db.prepare(`
+  INSERT INTO password_reset_otps (user_id, otp_hash, expires_at, attempts, used, created_at)
+  VALUES (@userId, @otpHash, @expiresAt, 0, 0, @createdAt)
 `);
 
-const getPasswordResetStmt = db.prepare(`
-  SELECT id, user_id, expires_at FROM password_resets WHERE token_hash = ? AND expires_at > ? LIMIT 1
+const getPasswordResetOtpStmt = db.prepare(`
+  SELECT id, user_id, otp_hash, attempts, used, expires_at
+  FROM password_reset_otps
+  WHERE user_id = ? AND used = 0
+  ORDER BY id DESC
+  LIMIT 1
 `);
 
-const deletePasswordResetStmt = db.prepare(`DELETE FROM password_resets WHERE id = ?`);
+const deletePasswordResetOtpsByUserStmt = db.prepare(`DELETE FROM password_reset_otps WHERE user_id = ?`);
+
+const incrementPasswordResetOtpAttemptStmt = db.prepare(`
+  UPDATE password_reset_otps
+  SET attempts = attempts + 1
+  WHERE id = ?
+`);
 
 const getLoginAttemptStmt = db.prepare(`
   SELECT id, attempts, locked_until, window_start FROM login_attempts WHERE email = ? AND ip_address = ? LIMIT 1
@@ -92,6 +98,22 @@ const insertLoginAttemptStmt = db.prepare(`
 
 const updateLoginAttemptStmt = db.prepare(`
   UPDATE login_attempts SET attempts = @attempts, locked_until = @lockedUntil, window_start = @windowStart WHERE id = @id
+`);
+
+const getAuthContextBySessionStmt = db.prepare(`
+  SELECT
+    s.id AS sessionId,
+    s.expires_at AS expiresAt,
+    u.id,
+    u.name,
+    u.email,
+    u.created_at AS createdAt,
+    u.updated_at AS updatedAt,
+    u.is_active AS isActive
+  FROM auth_sessions s
+  INNER JOIN users u ON u.id = s.user_id
+  WHERE s.id = ? AND s.expires_at > ?
+  LIMIT 1
 `);
 
 function sanitizeString(value, maxLength = 300) {
@@ -182,10 +204,6 @@ async function comparePasswordConstantTime(password, storedHash) {
   }
 
   return crypto.timingSafeEqual(left, right);
-}
-
-function pruneLoginFailures(now) {
-  db.prepare(`DELETE FROM login_attempts WHERE locked_until <= ? AND window_start <= ?`).run(now, now - LOGIN_WINDOW_MS);
 }
 
 function assertLoginAllowed(email, ipAddress) {
@@ -376,14 +394,7 @@ function getAuthContextByToken(token) {
 
   try {
     const payload = jwt.verify(normalizedToken, JWT_SECRET);
-
-    // Retrieve the database record matched strictly against the stored sessionId 
-    // (The session itself was natively verified via HS256 JWT signature above)
-    const sessionStmt = db.prepare(`
-        SELECT s.id AS sessionId, s.expires_at AS expiresAt, u.id, u.name, u.email, u.created_at AS createdAt, u.updated_at AS updatedAt, u.is_active AS isActive FROM auth_sessions s INNER JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > ? LIMIT 1
-     `);
-
-    const row = sessionStmt.get(payload.sessionId, new Date().toISOString());
+    const row = getAuthContextBySessionStmt.get(payload.sessionId, new Date().toISOString());
     if (!row) return null;
 
     return {
@@ -401,12 +412,6 @@ function deleteAuthSessionById(sessionId) {
   return Number(result.changes) > 0;
 }
 
-function deleteAuthSessionByToken(token) {
-  const tokenHash = hashSessionToken(token);
-  const result = deleteAuthSessionByTokenHashStmt.run(tokenHash);
-  return Number(result.changes) > 0;
-}
-
 async function requestOTP(email, type) {
   const normalizedEmail = normalizeEmail(email);
   const otp = crypto.randomInt(100000, 999999).toString();
@@ -417,6 +422,10 @@ async function requestOTP(email, type) {
 
   if (type === 'register') await sendEmail('verify', { to: normalizedEmail, otp });
   if (type === 'change_email') await sendEmail('email-change', { to: normalizedEmail, otp });
+
+  if (env.nodeEnv === 'test') {
+    return otp;
+  }
 }
 
 async function verifyOTP(email, type, otp) {
@@ -463,42 +472,64 @@ async function rotateRefreshToken(oldRefreshToken, ipAddress) {
 async function requestPasswordReset(email) {
   const normalizedEmail = normalizeEmail(email);
   const user = getUserByEmail(normalizedEmail);
-  if (!user) return; // Silent explicitly
-
-  const rawToken = generateSessionToken();
-  const tokenHash = hashSessionToken(rawToken);
-  const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
-
-  insertPasswordResetStmt.run({ userId: user.id, tokenHash, expiresAt, createdAt: new Date().toISOString() });
-  await sendEmail('reset', { to: normalizedEmail, token: rawToken });
-}
-
-async function executePasswordReset(token, newPassword) {
-  const tokenHash = hashSessionToken(token);
-  const nowStr = new Date().toISOString();
-  const row = getPasswordResetStmt.get(tokenHash, nowStr);
-
-  if (!row) {
-    throw createHttpError(400, 'INVALID_TOKEN', 'Reset token invalid or expired.');
+  if (!user) {
+    return undefined;
   }
 
-  deletePasswordResetStmt.run(row.id);
+  const otp = crypto.randomInt(100000, 999999).toString();
+  const otpHash = await hashPassword(otp);
+  const expiresAt = new Date(Date.now() + RESET_OTP_TTL_MS).toISOString();
+
+  insertPasswordResetOtpStmt.run({
+    userId: user.id,
+    otpHash,
+    expiresAt,
+    createdAt: new Date().toISOString(),
+  });
+  await sendEmail('reset', { to: normalizedEmail, otp });
+
+  if (env.nodeEnv === 'test') {
+    return otp;
+  }
+
+  return undefined;
+}
+
+async function executePasswordReset(email, otp, newPassword) {
+  const normalizedEmail = normalizeEmail(email);
+  const user = getUserByEmail(normalizedEmail);
+  if (!user) {
+    throw createHttpError(400, 'INVALID_OTP', 'OTP invalid or expired.');
+  }
+
+  const row = getPasswordResetOtpStmt.get(user.id);
+  if (!row || row.used || new Date(row.expires_at) < new Date()) {
+    throw createHttpError(400, 'INVALID_OTP', 'OTP invalid or expired.');
+  }
+
+  if (row.attempts >= 5) {
+    throw createHttpError(400, 'INVALID_OTP', 'Too many attempts.');
+  }
+
+  const isValid = await comparePasswordConstantTime(otp, row.otp_hash);
+  if (!isValid) {
+    incrementPasswordResetOtpAttemptStmt.run(row.id);
+    throw createHttpError(400, 'INVALID_OTP', 'OTP invalid or expired.');
+  }
+
+  deletePasswordResetOtpsByUserStmt.run(row.user_id);
 
   const passwordHash = await hashPassword(newPassword);
   db.prepare(`UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?`).run(passwordHash, new Date().toISOString(), row.user_id);
 
-  const user = getUserById(row.user_id);
-  if (user && user.email) {
-    await sendEmail('reset-success', { to: user.email });
+  const updatedUser = getUserById(row.user_id);
+  if (updatedUser && updatedUser.email) {
+    await sendEmail('reset-success', { to: updatedUser.email });
   }
 
   // Nuke sessions to force re-login on all devices
   db.prepare(`DELETE FROM auth_sessions WHERE user_id = ?`).run(row.user_id);
   db.prepare(`DELETE FROM refresh_tokens WHERE user_id = ?`).run(row.user_id);
-}
-
-function updateAuthSessionLastUsed(sessionId) {
-  db.prepare(`UPDATE auth_sessions SET last_used_at = ? WHERE id = ?`).run(new Date().toISOString(), sessionId);
 }
 
 function activateUser(email) {
@@ -518,7 +549,6 @@ module.exports = {
   createJWTAuthSession,
   getAuthContextByToken,
   deleteAuthSessionById,
-  deleteAuthSessionByToken,
   cleanupExpiredAuthSessions,
   comparePasswordConstantTime,
   requestOTP,
@@ -526,7 +556,6 @@ module.exports = {
   rotateRefreshToken,
   requestPasswordReset,
   executePasswordReset,
-  updateAuthSessionLastUsed,
   activateUser,
   updateUserEmail,
   JWT_SECRET,

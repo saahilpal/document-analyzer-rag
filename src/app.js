@@ -1,17 +1,16 @@
-require('dotenv').config();
-
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const env = require('./config/env');
 
-require('./db/database');
+require('./config/database');
 
-const apiV1Route = require('./routes/apiV1');
+const apiV1Route = require('./routes/api/v1');
 const rateLimiter = require('./middleware/rateLimiter');
 const { fail } = require('./routes/helpers');
 const { createHttpError, normalizeHttpError } = require('./utils/errors');
-const { logError } = require('./utils/logger');
+const { logError } = require('./config/logger');
 
 const app = express();
 
@@ -22,14 +21,7 @@ const DEFAULT_ALLOWED_ORIGIN_PATTERNS = [
   /^https:\/\/127\.0\.0\.1(:\d+)?$/i,
 ];
 
-function parseConfiguredOrigins(rawOrigins) {
-  return String(rawOrigins || '')
-    .split(',')
-    .map((origin) => origin.trim())
-    .filter(Boolean);
-}
-
-const configuredOrigins = parseConfiguredOrigins(process.env.CORS_ALLOWED_ORIGINS);
+const configuredOrigins = env.corsAllowedOrigins;
 const hasConfiguredOrigins = configuredOrigins.length > 0;
 
 function isAllowedOrigin(origin, normalizedOrigin) {
@@ -45,7 +37,7 @@ function isAllowedOrigin(origin, normalizedOrigin) {
 }
 
 app.disable('x-powered-by');
-app.set('trust proxy', process.env.TRUST_PROXY === 'true');
+app.set('trust proxy', env.trustProxy);
 
 app.use(helmet({
   crossOriginResourcePolicy: false,
@@ -67,8 +59,8 @@ app.use(cors({
   credentials: false,
 }));
 app.use(morgan('dev'));
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: false, limit: '2mb' }));
+app.use(express.json({ limit: env.maxRequestBodySizeBytes }));
+app.use(express.urlencoded({ extended: false, limit: env.maxRequestBodySizeBytes }));
 
 // Route-level authentication is applied inside /api/v1 router.
 app.use('/api/v1', rateLimiter({ windowMs: 60_000, maxRequests: 100 }), apiV1Route);
@@ -110,7 +102,7 @@ app.use((err, req, res, next) => {
 
   const normalized = normalizeHttpError(err);
   if (normalized.status === 500 && !isSqliteError) {
-    logError('ERROR_DB', err, {
+    logError('ERROR_APP', err, {
       route: req.originalUrl,
       method: req.method,
       status: normalized.status,

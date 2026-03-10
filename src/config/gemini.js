@@ -1,4 +1,5 @@
 const { GoogleGenAI, ApiError } = require('@google/genai');
+const env = require('./env');
 
 let geminiClient;
 
@@ -12,7 +13,7 @@ function getGenAI() {
     return geminiClient;
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = env.geminiApiKey;
   if (!apiKey) {
     throw new Error('Missing GEMINI_API_KEY in .env');
   }
@@ -33,7 +34,7 @@ function unique(items) {
 }
 
 function getGenerationModelCandidates() {
-  const configured = splitCandidates(process.env.GEMINI_MODEL);
+  const configured = splitCandidates(env.geminiModel);
   return unique([...configured, DEFAULT_GENERATION_MODEL]);
 }
 

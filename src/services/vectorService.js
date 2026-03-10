@@ -1,9 +1,12 @@
 const { v4: uuidv4 } = require('uuid');
-const db = require('../db/database');
+const db = require('../config/database');
+const env = require('../config/env');
 
 const MAX_PDF_CACHE_ENTRIES = 64;
 const MAX_CHUNK_CACHE_ENTRIES_PER_PDF = 200;
 const embeddingCacheByPdf = new Map();
+const DEFAULT_PAGE_SIZE = env.ragCandidatePageSize;
+const MAX_CHUNKS_PER_QUERY = env.maxChunksPerQuery;
 
 const insertChunkStmt = db.prepare(`
   INSERT OR REPLACE INTO chunks (id, sessionId, pdfId, chunkKey, text, embedding, embeddingVectorLength, createdAt)
@@ -173,17 +176,18 @@ async function similaritySearch({
   sessionId,
   queryEmbedding,
   topK = 5,
-  pageSize = Number(process.env.RAG_CANDIDATE_PAGE_SIZE) || 400,
+  pageSize = DEFAULT_PAGE_SIZE,
   onProgress,
 }) {
   const normalizedTopK = Math.max(1, Math.min(5, Number(topK) || 5));
   const normalizedPageSize = Math.max(50, Math.min(1000, Number(pageSize) || 400));
   const totalRows = countChunksBySessionStmt.get(sessionId).count;
+  const boundedTotalRows = Math.min(totalRows, MAX_CHUNKS_PER_QUERY);
   const queryVectorLength = Array.isArray(queryEmbedding) ? queryEmbedding.length : 0;
 
-  if (!queryVectorLength || totalRows === 0) {
+  if (!queryVectorLength || boundedTotalRows === 0) {
     if (typeof onProgress === 'function') {
-      onProgress({ processed: 0, total: totalRows });
+      onProgress({ processed: 0, total: boundedTotalRows });
     }
     return [];
   }
@@ -191,11 +195,11 @@ async function similaritySearch({
   let offset = 0;
   let bestMatches = [];
 
-  while (offset < totalRows) {
+  while (offset < boundedTotalRows) {
     const rows = selectChunkPageBySessionStmt.all(
       sessionId,
       queryVectorLength,
-      normalizedPageSize,
+      Math.min(normalizedPageSize, boundedTotalRows - offset),
       offset
     );
     if (rows.length === 0) {
@@ -223,8 +227,8 @@ async function similaritySearch({
 
     if (typeof onProgress === 'function') {
       onProgress({
-        processed: Math.min(offset, totalRows),
-        total: totalRows,
+        processed: Math.min(offset, boundedTotalRows),
+        total: boundedTotalRows,
       });
     }
 

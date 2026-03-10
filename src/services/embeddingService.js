@@ -1,9 +1,10 @@
 let extractorPromise = null;
-const { logInfo } = require('../utils/logger');
+const { logInfo } = require('../config/logger');
+const env = require('../config/env');
 
-const DEFAULT_BATCH_SIZE = Number(process.env.LOCAL_EMBEDDING_BATCH_SIZE) || 24;
-const MIN_BATCH_SIZE = Number(process.env.LOCAL_EMBEDDING_BATCH_SIZE_MIN) || 8;
-const MAX_BATCH_SIZE = Number(process.env.LOCAL_EMBEDDING_BATCH_SIZE_MAX) || 64;
+const DEFAULT_BATCH_SIZE = env.localEmbeddingBatchSize;
+const MIN_BATCH_SIZE = env.localEmbeddingBatchSizeMin;
+const MAX_BATCH_SIZE = env.localEmbeddingBatchSizeMax;
 
 async function getExtractor() {
   if (extractorPromise) {

@@ -1,3 +1,5 @@
+const env = require('../config/env');
+
 function sanitizeExtractedText(input) {
   const normalized = String(input || '')
     .replace(/\u0000/g, '')
@@ -21,6 +23,9 @@ function ensureTextNotEmpty(text, code = 'EMPTY_PARSED_TEXT') {
     error.statusCode = 400;
     error.code = code;
     throw error;
+  }
+  if (normalized.length > env.maxExtractedTextLength) {
+    return normalized.slice(0, env.maxExtractedTextLength);
   }
   return normalized;
 }

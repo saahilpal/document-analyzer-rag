@@ -1,4 +1,4 @@
-const { openDatabase, runMigrations } = require('./migration');
+const { openDatabase, runMigrations } = require('../database/migrations');
 
 runMigrations({ dryRun: false });
 

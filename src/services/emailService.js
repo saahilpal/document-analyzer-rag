@@ -1,4 +1,6 @@
 const nodemailer = require('nodemailer');
+const env = require('../config/env');
+const { logError } = require('../config/logger');
 
 const {
   SMTP_HOST,
@@ -55,7 +57,7 @@ function renderEmailTemplate(title, bodyHtml) {
 }
 
 async function sendEmail(type, data) {
-  if (process.env.NODE_ENV === 'test') {
+  if (env.nodeEnv === 'test') {
     return true;
   }
 
@@ -132,7 +134,7 @@ async function sendEmail(type, data) {
     const info = await transporter.sendMail(mailOptions);
     return info;
   } catch (error) {
-    console.error('[EmailService] Failed to send email:', error);
+    logError('ERROR_EMAIL', error, { service: 'emailService', stage: 'sendMail', type });
     throw error;
   }
 }

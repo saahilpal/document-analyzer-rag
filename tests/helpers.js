@@ -10,19 +10,41 @@ async function createAuthContext(app, options = {}) {
     password: options.password || 'SecurePass123!',
   };
 
-  const response = await request(app)
+  const registerResponse = await request(app)
     .post('/api/v1/auth/register')
     .send(payload);
 
-  if (response.status !== 200 || !response.body?.ok) {
-    throw new Error(`Failed to create auth context: status=${response.status} body=${JSON.stringify(response.body)}`);
+  if (registerResponse.status !== 200 || !registerResponse.body?.ok) {
+    throw new Error(`Failed to create auth context (register): status=${registerResponse.status} body=${JSON.stringify(registerResponse.body)}`);
+  }
+
+  const otp = registerResponse.body.data?.otp;
+  if (!otp) {
+    console.error('Registration Response:', JSON.stringify(registerResponse.body, null, 2));
+    throw new Error('No OTP returned from register in test environment');
+  }
+
+  const verifyResponse = await request(app)
+    .post('/api/v1/auth/verify-otp')
+    .send({ email: payload.email, otp });
+
+  if (verifyResponse.status !== 200 || !verifyResponse.body?.ok) {
+    throw new Error(`Failed to verify OTP: status=${verifyResponse.status} body=${JSON.stringify(verifyResponse.body)}`);
+  }
+
+  const loginResponse = await request(app)
+    .post('/api/v1/auth/login')
+    .send({ email: payload.email, password: payload.password });
+
+  if (loginResponse.status !== 200 || !loginResponse.body?.ok) {
+    throw new Error(`Failed to login for auth context: status=${loginResponse.status} body=${JSON.stringify(loginResponse.body)}`);
   }
 
   return {
-    user: response.body.data.user,
-    token: response.body.data.token,
+    user: loginResponse.body.data.user,
+    token: loginResponse.body.data.accessToken,
     authHeader: {
-      Authorization: `Bearer ${response.body.data.token}`,
+      Authorization: `Bearer ${loginResponse.body.data.accessToken}`,
     },
   };
 }

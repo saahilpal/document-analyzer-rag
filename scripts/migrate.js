@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const path = require('path');
-const { runMigrations } = require(path.join(__dirname, '..', 'src', 'db', 'migration'));
+const { runMigrations } = require(path.join(__dirname, '..', 'src', 'database', 'migrations'));
 
 const dryRun = process.argv.includes('--dry-run');
 

@@ -6,13 +6,14 @@ const {
 } = require('../config/gemini');
 const { generateEmbedding } = require('./embeddingService');
 const { similaritySearch, getChunkCountBySession } = require('./vectorService');
-const { logError } = require('../utils/logger');
+const { logError } = require('../config/logger');
+const env = require('../config/env');
 
-const DEFAULT_TOP_K = Number(process.env.RAG_TOP_K) || 5;
-const DEFAULT_CANDIDATE_PAGE_SIZE = Number(process.env.RAG_CANDIDATE_PAGE_SIZE) || 400;
-const DEFAULT_HISTORY_LIMIT = Number(process.env.RAG_HISTORY_LIMIT) || 12;
+const DEFAULT_TOP_K = env.ragTopK;
+const DEFAULT_CANDIDATE_PAGE_SIZE = env.ragCandidatePageSize;
+const DEFAULT_HISTORY_LIMIT = env.ragHistoryLimit;
 const FALLBACK_ANSWER = "I don't know - please provide more context.";
-const DEFAULT_RESPONSE_STYLE = String(process.env.RAG_RESPONSE_STYLE || 'structured').toLowerCase();
+const DEFAULT_RESPONSE_STYLE = env.ragResponseStyle;
 const RESPONSE_STYLES = new Set(['plain', 'structured']);
 
 function createGenerationError(message, details) {

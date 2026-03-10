@@ -4,12 +4,13 @@ const { chunkText } = require('./chunkService');
 const { generateEmbeddings } = require('./embeddingService');
 const { addChunks } = require('./vectorService');
 const { getPdfById, markPdfIndexed, markPdfFailed } = require('./pdfRecordService');
-const { logInfo, logError } = require('../utils/logger');
+const { logInfo, logError } = require('../config/logger');
+const env = require('../config/env');
 
-const TOKEN_TO_CHAR_RATIO = Number(process.env.RAG_TOKEN_TO_CHAR_RATIO) || 4;
-const DEFAULT_CHUNK_TOKENS = Number(process.env.RAG_CHUNK_TOKENS) || 1000;
-const DEFAULT_OVERLAP_TOKENS = Number(process.env.RAG_CHUNK_OVERLAP_TOKENS) || 200;
-const DEFAULT_BATCH_SIZE = Number(process.env.LOCAL_EMBEDDING_BATCH_SIZE) || 24;
+const TOKEN_TO_CHAR_RATIO = env.ragTokenToCharRatio;
+const DEFAULT_CHUNK_TOKENS = env.ragChunkTokens;
+const DEFAULT_OVERLAP_TOKENS = env.ragOverlapTokens;
+const DEFAULT_BATCH_SIZE = env.localEmbeddingBatchSize;
 
 function getIndexingParams(text) {
   const approxTokens = Math.ceil(text.length / TOKEN_TO_CHAR_RATIO);

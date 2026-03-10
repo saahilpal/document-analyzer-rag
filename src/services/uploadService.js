@@ -1,10 +1,11 @@
 const fsSync = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
+const env = require('../config/env');
 
 const uploadsRoot = path.resolve(process.cwd(), 'data', 'uploads');
 const tempUploadsRoot = path.join(uploadsRoot, '.tmp');
-const MAX_UPLOAD_FILE_SIZE_BYTES = Number(process.env.MAX_UPLOAD_FILE_SIZE_BYTES) || 50 * 1024 * 1024;
+const MAX_UPLOAD_FILE_SIZE_BYTES = env.maxUploadFileSizeBytes;
 
 const ALLOWED_UPLOAD_MIME_TYPES = new Set([
   'text/plain',
@@ -28,6 +29,14 @@ const FILE_TYPE_TO_EXTENSION = {
   docx: 'docx',
   csv: 'csv',
   pdf: 'pdf',
+};
+
+const FILE_TYPE_ALLOWED_EXTENSIONS = {
+  txt: new Set(['txt']),
+  md: new Set(['md', 'markdown']),
+  docx: new Set(['docx']),
+  csv: new Set(['csv']),
+  pdf: new Set(['pdf']),
 };
 
 function sanitizeFilename(filename) {
@@ -155,6 +164,26 @@ function assertTypeSignatureCompatibility(fileType, signatureType) {
   }
 }
 
+function getOriginalFileExtension(originalname) {
+  const extension = path.extname(String(originalname || '')).toLowerCase().replace(/^\./, '');
+  return extension || '';
+}
+
+function assertFileExtensionCompatibility(fileType, originalname) {
+  const extension = getOriginalFileExtension(originalname);
+  const allowedExtensions = FILE_TYPE_ALLOWED_EXTENSIONS[fileType];
+  if (!allowedExtensions || !allowedExtensions.size) {
+    throw createUploadValidationError(415, 'UNSUPPORTED_FILE_TYPE', 'Unsupported uploaded file type.');
+  }
+  if (!extension || !allowedExtensions.has(extension)) {
+    throw createUploadValidationError(
+      415,
+      'INVALID_FILE_EXTENSION',
+      `Uploaded file extension does not match expected ${fileType.toUpperCase()} type.`
+    );
+  }
+}
+
 async function inspectUploadedFile(file) {
   const mimetype = String(file?.mimetype || '').toLowerCase().trim();
   const originalname = String(file?.originalname || 'upload.bin').toLowerCase().trim();
@@ -177,6 +206,7 @@ async function inspectUploadedFile(file) {
   if (!fileType) {
     throw createUploadValidationError(415, 'INVALID_FILE_MIME', 'Unsupported MIME type for uploaded file.');
   }
+  assertFileExtensionCompatibility(fileType, originalname);
 
   const signatureBuffer = await readFileSignature(filePath);
   const signatureType = detectSignatureType(signatureBuffer);

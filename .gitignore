@@ -7,6 +7,9 @@ node_modules/
 
 # Runtime/generated data
 data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 uploads/
 tmp/
 .tmp/

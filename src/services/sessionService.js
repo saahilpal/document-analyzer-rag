@@ -1,4 +1,4 @@
-const db = require('../db/database');
+const db = require('../config/database');
 const { invalidatePdfCache } = require('./vectorService');
 
 const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all().map((column) => column.name);
